@@ -1,0 +1,14 @@
+.venv/
+.env
+*.db
+*.db-wal
+*.db-shm
+*.jsonl
+__pycache__/
+.idea/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+# Google OAuth: the client file downloaded from Cloud Console, and the token saved after login.
+client_secret*.json
+google_token.json
