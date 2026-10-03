@@ -7,6 +7,7 @@ dependencies = [
   "fastapi[standard]>=0.115,<0.121",
   # Python's zoneinfo needs a timezone database, and Windows doesn't ship one. Calling hours
   # depend on it, so a missing database must be an install error, not a runtime surprise.
+  "python-dotenv>=1.2.4",
   "tzdata>=2026.4",
 ]
 
