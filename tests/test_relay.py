@@ -3,22 +3,24 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
-from call_fakes import SETTINGS, ScriptedJev, make_services
+from call_fakes import GUARD_CHECK, SETTINGS, ScriptedJev, make_services
 from conftest import DANA_PHONE, HOURS, MONDAY_10AM, make_consent, make_lead
 from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketTestSession
 from test_booking import FakeCalendar
 
-from lead_bot.call_script import call_twiml, opening_greeting
+from lead_bot.call_script import CHECKING_LINE, call_twiml, opening_greeting
 from lead_bot.relay import RELAY_PATH
 from lead_bot.server import create_app
 from lead_bot.store import Store
+from lead_bot.writer import Turn
 
 
 @pytest.fixture
@@ -176,3 +178,62 @@ def test_a_business_name_with_an_ampersand_keeps_the_twiml_valid() -> None:
     relay = root.find("./Connect/ConversationRelay")
     assert relay is not None
     assert relay.attrib["welcomeGreeting"].startswith('Hello, this call is from Smith & Sons "Roofing".')
+
+
+class SlowWriter:
+    """A writer that waits until released, like a model call taking seconds."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.started = threading.Event()
+        self.finished = threading.Event()
+
+    def write(self, *, facts: str, history: Sequence[Turn], reason: str) -> str:
+        self.started.set()
+        try:
+            # Gives up after 5 seconds, so a broken relay fails the test instead of hanging it.
+            self.release.wait(timeout=5)
+            return "It takes about an hour."
+        finally:
+            self.finished.set()
+
+
+def test_let_me_check_is_sent_before_the_writer_finishes(store: Store, placed_call: tuple[int, str]) -> None:
+    call_id, token = placed_call
+    writer = SlowWriter()
+    services = make_services(ScriptedJev("other_question", GUARD_CHECK), FakeCalendar(), writer=writer)
+    app = create_app(store, SETTINGS, clock=lambda: MONDAY_10AM, call_services=services)
+    with TestClient(app).websocket_connect(RELAY_PATH) as socket:
+        socket.send_json(setup_message(call_id, token))
+        socket.send_json({"type": "prompt", "voicePrompt": "How long does it take?", "last": True})
+        filler = socket.receive_json()  # arrives while the writer is still blocked
+        assert writer.started.wait(timeout=5)
+        writer.release.set()
+        answer = socket.receive_json()
+        socket.send_json({"type": "dtmf", "digit": "9"})
+        receive_until_end(socket)
+
+    assert filler == {"type": "text", "token": CHECKING_LINE, "last": True}
+    assert answer["token"].startswith("It takes about an hour. Do you have a couple of minutes")
+
+
+def test_a_9_while_the_writer_works_hangs_up_at_once(store: Store, placed_call: tuple[int, str]) -> None:
+    call_id, token = placed_call
+    writer = SlowWriter()
+    # No GUARD_CHECK scripted: the call ends before the draft could be checked.
+    services = make_services(ScriptedJev("other_question"), FakeCalendar(), writer=writer)
+    app = create_app(store, SETTINGS, clock=lambda: MONDAY_10AM, call_services=services)
+    with TestClient(app).websocket_connect(RELAY_PATH) as socket:
+        socket.send_json(setup_message(call_id, token))
+        socket.send_json({"type": "prompt", "voicePrompt": "How long does it take?", "last": True})
+        assert socket.receive_json()["token"] == CHECKING_LINE
+        assert writer.started.wait(timeout=5)
+        socket.send_json({"type": "dtmf", "digit": "9"})
+        # The end arrives while the writer is still blocked: the 9 didn't wait behind it.
+        [end] = receive_until_end(socket)
+        writer_was_still_working = not writer.finished.is_set()
+        writer.release.set()
+
+    assert writer_was_still_working
+    assert json.loads(end["handoffData"]) == {"result": "opted_out"}
+    assert store.is_on_do_not_call(DANA_PHONE)

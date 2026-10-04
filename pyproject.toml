@@ -10,6 +10,7 @@ dependencies = [
   "google-auth-oauthlib>=1.2,<2",
   # Google Calendar requests (google_calendar.py, copied from booking-bot).
   "httpx2>=2.0.0,<3",
+  "openai>=2.54,<3",
   "python-dotenv>=1.2.4",
   # Jev: reads each thing the homeowner says on a call.
   "typesafe-sdk>=0.7.1,<0.8",

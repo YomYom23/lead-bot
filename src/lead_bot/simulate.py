@@ -39,7 +39,7 @@ from websockets.sync.client import ClientConnection, connect
 
 from .booking import CalendarBooking
 from .call_questions import HAZARD_QUESTIONS
-from .call_script import call_twiml
+from .call_script import CHECKING_LINE, call_twiml
 from .call_session import CallServices
 from .consent import CONSENT_VERSION, ConsentEvidence, consent_text
 from .dialer import dial_next_due_call
@@ -261,6 +261,8 @@ def print_replies(websocket: ClientConnection, wait: float, sent_at: float) -> b
         wait = FOLLOW_UP_MESSAGE_WAIT_SECONDS
         if message.get("type") == "text":
             print(f"BOT ({time.monotonic() - sent_at:.2f}s): {message['token']}")
+            if message["token"] == CHECKING_LINE:
+                wait = REPLY_WAIT_SECONDS  # the writer's answer follows, after a model call
         elif message.get("type") == "end":
             print(f"[simulator] the bot hung up: {json.loads(message.get('handoffData') or '{}')}")
             return True

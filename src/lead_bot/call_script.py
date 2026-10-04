@@ -15,6 +15,8 @@ because the research paper treats them as the safe default.
 from __future__ import annotations
 
 import html
+import re
+from datetime import time
 
 from .settings import BusinessSettings
 
@@ -37,6 +39,58 @@ PRICE_LINE = (
 )
 QUESTION_FOR_TEAM_LINE = "I'll pass that question to our team so the inspector can answer it."
 
+# Said the moment an off-script question is recognised, before the writer drafts an answer. The
+# writer and the guard take a second or two, and without this the homeowner hears dead air.
+CHECKING_LINE = "Let me check."
+
+# What the writer may say about the business beyond what call_facts() works out from settings.
+# PLACEHOLDER, like the inspection hours in settings.py, until a real roofer gives theirs. Every
+# sentence here can be spoken to a homeowner, so nothing goes in that the business hasn't approved.
+PLACEHOLDER_BUSINESS_FACTS = (
+    "The inspection is free, and agreeing to it doesn't commit the homeowner to buying anything.",
+    "The inspector documents what they find on the roof.",
+    "After the inspection the homeowner gets a written estimate for any work that's needed.",
+    "The company does roof repairs and roof replacements for homes.",
+)
+
+
+def _spoken_clock_time(clock_time: time) -> str:
+    """time(8, 0) -> '8 AM', time(17, 30) -> '5:30 PM'. Same style as the slot labels."""
+    hour_on_12_hour_clock = clock_time.hour % 12 or 12
+    minutes = f":{clock_time.minute:02d}" if clock_time.minute else ""
+    return f"{hour_on_12_hour_clock}{minutes} {'AM' if clock_time.hour < 12 else 'PM'}"
+
+
+def call_facts(settings: BusinessSettings, address: str, booked_label: str | None) -> str:
+    """Everything the writer is allowed to state on this call, one fact per line.
+
+    The guard's unsupported_fact check compares each draft against exactly this text, so a
+    fact missing here gets the draft blocked rather than invented.
+    """
+    rules = settings.inspection_rules
+    weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    open_days = [weekday_names[weekday] for weekday in sorted(rules.open_weekdays)]
+    inspection_minutes = int(rules.appointment_length.total_seconds() // 60)
+    booking = (
+        f"An inspection is booked on this call for {booked_label}."
+        if booked_label is not None
+        else "No inspection has been booked yet on this call."
+    )
+    return "\n".join(
+        [
+            f"Business name: {settings.business_name}.",
+            "This assistant is an artificial intelligence, and the call is transcribed.",
+            f"Callback number: {spoken_digits(settings.callback_phone)}.",
+            f"Inspections take about {inspection_minutes} minutes.",
+            f"Inspections can be booked {open_days[0]} to {open_days[-1]}, between "
+            f"{_spoken_clock_time(rules.opening_time)} and {_spoken_clock_time(rules.closing_time)}, "
+            f"up to {rules.days_ahead} days ahead.",
+            f"The inspection address on file: {address}.",
+            booking,
+            *PLACEHOLDER_BUSINESS_FACTS,
+        ]
+    )
+
 
 def spoken_digits(e164_phone: str) -> str:
     """'+14805550199' -> '4 8 0, 5 5 5, 0 1 9 9'.
@@ -46,6 +100,17 @@ def spoken_digits(e164_phone: str) -> str:
     """
     digits = e164_phone.removeprefix("+1")
     return f"{' '.join(digits[:3])}, {' '.join(digits[3:6])}, {' '.join(digits[6:])}"
+
+
+# A US phone number written the usual ways: 480-555-0199, (480) 555-0199, 480.555.0199, and with a
+# leading +1 or 1. The writer is given the number already spaced out, but rewrote it as
+# 480-555-0199 in the phase 3 scenario run.
+WRITTEN_PHONE_NUMBER = re.compile(r"(?:\+?1[-. ]?)?\(?\b(\d{3})\)?[-. ]?(\d{3})[-. ](\d{4})\b")
+
+
+def speakable_phone_numbers(text: str) -> str:
+    """Every written phone number in `text`, rewritten digit by digit as spoken_digits does."""
+    return WRITTEN_PHONE_NUMBER.sub(lambda match: spoken_digits("+1" + "".join(match.groups())), text)
 
 
 def opening_greeting(settings: BusinessSettings) -> str:

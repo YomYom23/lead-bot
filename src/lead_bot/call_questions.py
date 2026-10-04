@@ -68,7 +68,9 @@ STAGE_OPTIONS: dict[Stage, dict[str, str]] = {
         "unsure": "Says they don't know",
     },
     "insurance": {
-        "yes": "Plans to file an insurance claim, or already has",
+        # "Probably" counts as yes: the answer only routes the lead, so leaning one way is enough.
+        # Without it, "probably, yes" fell between yes and unsure and was heard as unclear.
+        "yes": "Plans to file an insurance claim, probably will, or already has",
         "no": "Isn't filing an insurance claim",
         "unsure": "Hasn't decided or doesn't know",
     },
@@ -96,9 +98,13 @@ def build_call_questions(stage: Stage, offered_slots: Sequence[Slot]) -> dict[st
             raise ValueError(f"reserved option ids used as slot ids: {sorted(clashing_ids)}")
         # The options ARE the offered times, so Jev can only return a time that was offered,
         # never one it made up.
+        # A question about other days ("do you do Saturdays?") must not land here: this option
+        # ends the call, and the phase 3 scenario run showed it hanging up on that question.
+        # Questions go to other_question, which the writer answers before re-offering.
         stage_options = {
             **{slot.id: slot.label for slot in offered_slots},
-            NO_SLOT_OPTION: "Turns down all of these times, or asks for a different time",
+            NO_SLOT_OPTION: "Turns down all of these times, or says they want a different day or time. "
+            "Not a question about which days or times are possible",
         }
     else:
         stage_options = STAGE_OPTIONS[stage]

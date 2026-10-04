@@ -7,8 +7,14 @@ the WebSocket is what lets the tests (and the scenario runner in phase 3) drive 
 
 The call goes through these stages, one question each:
     permission -> address -> leak -> insurance -> homeowner -> offer -> anything_else
-Every sentence the bot says comes from this file or call_script.py. No AI writes text in
-phase 2: Jev only classifies what the homeowner said, and the reply is chosen from the result.
+Almost every sentence the bot says comes from this file or call_script.py: Jev classifies what
+the homeowner said, and the reply is chosen from the result. The one exception is an off-script
+question with no fixed answer ("how long does the inspection take?"). That turn has two parts:
+  1. on_prompt says "Let me check." and returns ContinueTurn, so the homeowner isn't left in
+     silence while a model works.
+  2. continue_turn has writer.py draft an answer, guard.py check it, then speaks the draft, or
+     the fixed "I'll pass that to our team" line if the draft failed any check or anything
+     failed. Unchecked text is never spoken.
 
 Thread safety: relay.py runs on_prompt in a worker thread (it waits on Jev, which blocks), and
 on_keypress can arrive while that's in progress. A 9 must end the call at once, not after Jev
@@ -21,6 +27,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,19 +36,24 @@ from typing import Any
 from .booking import CalendarBooking, CalendarUnavailable
 from .call_questions import NO_SLOT_OPTION, OFF_SCRIPT_OPTIONS, Stage, build_call_questions
 from .call_script import (
+    CHECKING_LINE,
     INSURANCE_LINE,
     OPT_OUT_DIGIT,
     PERMISSION_QUESTION,
     PRICE_LINE,
     QUESTION_FOR_TEAM_LINE,
+    call_facts,
     opening_greeting,
+    speakable_phone_numbers,
 )
 from .google_calendar import GoogleAuthExpired
+from .guard import REPLY_CHECKS, find_reply_problems
 from .jev import Answer, JevError, choice_answer, yes_probability
 from .leads import PROBLEM_LABELS
 from .settings import BusinessSettings
 from .slots import Slot, earliest_per_day
 from .store import ConnectedCall, LeadStatus, Store
+from .writer import NOT_IN_FACTS, Turn, Writer, WriterError
 
 logger = logging.getLogger(__name__)
 
@@ -82,20 +94,46 @@ class EndCall:
     reason: str
 
 
-Action = Say | EndCall
+@dataclass(frozen=True)
+class ContinueTurn:
+    """Send what came before this, then call continue_turn() for the rest of the turn.
+
+    Used after "Let me check.", so the filler is heard while the writer and guard work.
+    """
+
+
+Action = Say | EndCall | ContinueTurn
+
+
+@dataclass(frozen=True)
+class WriterOutcome:
+    """What happened to one off-script question. The scenario report counts these."""
+
+    question: str
+    draft: str | None  # None when the writer failed before producing one
+    problems: tuple[str, ...]  # failed guard checks, or "writer_failed" / "guard_unavailable"
+    seconds: float  # writer plus guard, the silence after "Let me check."
+
+    @property
+    def spoken(self) -> bool:
+        return self.draft is not None and not self.problems
 
 
 @dataclass(frozen=True)
 class CallServices:
-    """What a call needs from outside: Jev, and the calendar booking.
+    """What a call needs from outside: Jev, the calendar booking, and the writer.
 
     `booking` is a function rather than a CalendarBooking because the Google sign-in is only
     read when a call first needs the calendar. A missing or expired sign-in then fails that one
     booking (GoogleAuthExpired, handed to a person) instead of stopping the whole server.
+
+    `writer` is optional: without one, an off-script question gets the fixed "our team will
+    answer that" line, as in phase 2. The --offline simulator runs that way.
     """
 
     ask_jev: AskJev
     booking: Callable[[], CalendarBooking]
+    writer: Writer | None = None
 
 
 class CallSession:
@@ -120,6 +158,12 @@ class CallSession:
         self._unclear_in_a_row = 0
         self._jev_failures_in_a_row = 0
         self._slot_taken_count = 0
+        # What was said on the call, for the writer. Filled in by _log.
+        self._history: list[Turn] = []
+        # The off-script question continue_turn() still has to answer: the words, the stage it
+        # was asked in, and the call so far. Set by on_prompt, taken (and cleared) by continue_turn.
+        self._pending_question: tuple[str, Stage, list[Turn]] | None = None
+        self.writer_outcomes: list[WriterOutcome] = []
         self._last_said = opening_greeting(settings)
         # Twilio speaks the opening itself, before we hear anything, so it's logged here.
         self._log("bot", self._last_said)
@@ -203,7 +247,65 @@ class CallSession:
             option = "unclear"
         else:
             option = choice.choice
-        return self._handle(stage, option, offered_slots)
+        return self._handle(stage, option, offered_slots, words)
+
+    def continue_turn(self) -> list[Action]:
+        """The second half of an off-script question's turn, after "Let me check." was sent.
+
+        Three gates, the same as booking-bot's pipeline. A draft is spoken only if the writer
+        produced one, Jev could check it, and it passed every check. Any failure speaks the fixed
+        line and alerts the owner, so a person still answers the question after the call.
+        """
+        with self._state_lock:
+            if self.ended or self._pending_question is None:
+                return []  # a 9 or a hang-up arrived during "Let me check."
+            question, stage, history = self._pending_question
+            self._pending_question = None
+            booked_label = self.booked_label
+
+        writer = self._services.writer
+        if writer is None:  # build_call_services always sets one; the offline simulator doesn't
+            return self._question_for_team(stage, "no_writer")
+        facts = call_facts(self._settings, self._call.address, booked_label)
+        started = time.monotonic()
+
+        # Gate 1: the writer must produce a draft.
+        try:
+            draft: str | None = writer.write(facts=facts, history=history, reason="off_script_question")
+        except WriterError as error:
+            logger.warning("call %d: writer failed: %s", self._call.call_id, error)
+            draft = None
+        if draft is None:
+            problems: list[str] = ["writer_failed"]
+        elif NOT_IN_FACTS in draft:
+            # The facts don't answer it. The deferral is said by code, which also alerts the
+            # owner, so "our team will answer that" is never a promise nobody was told about.
+            problems = ["not_in_facts"]
+        else:
+            # The writer rewrites numbers like 480-555-0199, which a voice can read as "four
+            # hundred eighty". Converted before the guard, so it checks exactly what is spoken.
+            draft = speakable_phone_numbers(draft)
+            # Gate 2: Jev must be reachable to check it. If not, the draft is thrown away.
+            check_state = {"FACTS": facts, "HOMEOWNER_QUESTION": question, "REPLY": draft}
+            try:
+                check_answers = self._services.ask_jev(check_state, REPLY_CHECKS)
+            except JevError as error:
+                logger.warning("call %d: guard unavailable: %s", self._call.call_id, error)
+                problems = ["guard_unavailable"]
+            else:
+                # Gate 3: the draft must pass every check.
+                problems = find_reply_problems(draft, check_answers)
+        outcome = WriterOutcome(question, draft, tuple(problems), time.monotonic() - started)
+        self.writer_outcomes.append(outcome)
+
+        with self._state_lock:
+            if self.ended:  # a 9 arrived while the writer or guard was working: say nothing
+                return []
+        if not outcome.spoken or draft is None:
+            self._log("system", f"writer draft not spoken ({', '.join(problems)}): {draft!r}")
+            return self._question_for_team(stage, problems[0])
+        # The answer, then the question the call was waiting on, so the script carries on.
+        return self._say(f"{draft} {self._question(stage)}")
 
     def on_hangup(self) -> None:
         """The line closed. Records how the call ended if nothing has yet; safe to call twice."""
@@ -226,9 +328,9 @@ class CallSession:
 
     # ---- the stages ----
 
-    def _handle(self, stage: Stage, option: str, offered_slots: Sequence[Slot]) -> list[Action]:
+    def _handle(self, stage: Stage, option: str, offered_slots: Sequence[Slot], words: str) -> list[Action]:
         if option in OFF_SCRIPT_OPTIONS:
-            return self._off_script(option)
+            return self._off_script(option, words)
         self._unclear_in_a_row = 0
 
         if stage == "permission":
@@ -285,7 +387,7 @@ class CallSession:
                     owner_alert="needs_a_different_inspection_time",
                 )
             if option not in {slot.id for slot in offered_slots}:
-                return self._off_script("unclear")
+                return self._off_script("unclear", words)
             return self._book(option)
 
         # anything_else
@@ -298,15 +400,21 @@ class CallSession:
             lead_status=result_status,
         )
 
-    def _off_script(self, option: str) -> list[Action]:
+    def _off_script(self, option: str, words: str) -> list[Action]:
         if option == "insurance_question":
             return self._say(f"{INSURANCE_LINE} {self._question(self.stage)}")
         if option == "price_question":
             return self._say(f"{PRICE_LINE} {self._question(self.stage)}")
         if option == "other_question":
-            # Phase 3 adds the writer for these. Until then a person answers it after the call.
-            self._alert_owner("homeowner_asked_a_question_the_bot_cannot_answer")
-            return self._say(f"{QUESTION_FOR_TEAM_LINE} {self._question(self.stage)}")
+            if self._services.writer is None:
+                return self._question_for_team(self.stage, "no_writer")
+            # The writer answers it in continue_turn. "Let me check." goes out first; it isn't
+            # remembered as the last thing said, so "repeat" still repeats the real question.
+            # The history is copied BEFORE the filler is logged: the writer must see the
+            # homeowner's question as the last turn, not the bot's own "Let me check."
+            self._pending_question = (words, self.stage, list(self._history))
+            self._unclear_in_a_row = 0
+            return [*self._say(CHECKING_LINE, remember=False), ContinueTurn()]
         if option == "repeat":
             return self._say(self._last_said)
         self._unclear_in_a_row += 1
@@ -319,6 +427,11 @@ class CallSession:
                 owner_alert="bot_could_not_understand",
             )
         return self._say(f"Sorry, I didn't catch that. {self._question(self.stage)}")
+
+    def _question_for_team(self, stage: Stage, why: str) -> list[Action]:
+        """The fixed answer to a question the bot can't answer itself: a person follows up."""
+        self._alert_owner(f"homeowner_question_for_the_team:{why}")
+        return self._say(f"{QUESTION_FOR_TEAM_LINE} {self._question(stage)}")
 
     def _offer_times(self, prefix: str) -> list[Action]:
         try:
@@ -491,3 +604,8 @@ class CallSession:
 
     def _log(self, speaker: str, text: str) -> None:
         self._store.add_call_turn(self._call.call_id, speaker, text, self._clock())
+        # The writer sees only what was said aloud, not keypresses or system notes.
+        if speaker == "bot":
+            self._history.append(Turn("assistant", text))
+        elif speaker == "homeowner":
+            self._history.append(Turn("user", text))

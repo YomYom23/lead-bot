@@ -21,12 +21,18 @@ from .google_calendar import (
 from .jev import Jev
 from .settings import BusinessSettings
 from .slots import BookingRules
+from .writer import OpenAIWriter
 
 # On a call, every second of waiting is silence the homeowner hears. One retry, then the call
 # hands off to a person ("someone will call you back") rather than leaving them on hold.
 JEV_TIMEOUT_SECONDS = 2.5
 JEV_RETRIES = 1
 CALENDAR_TIMEOUT_SECONDS = 5.0
+# The writer runs after "Let me check.", so it gets a little longer than Jev, but no retry: a
+# failed draft falls back to the fixed "our team will answer that" line straight away.
+WRITER_TIMEOUT_SECONDS = 4.0
+# WRITER_MODEL in .env overrides this, so trying another model needs no code change.
+DEFAULT_WRITER_MODEL = "gpt-6-luna"
 
 
 class GoogleBookingLoader:
@@ -65,9 +71,13 @@ class GoogleBookingLoader:
 
 
 def build_call_services(settings: BusinessSettings) -> CallServices:
-    if not os.environ.get("TYPESAFE_API_KEY", "").strip():
+    missing = [
+        name for name in ("TYPESAFE_API_KEY", "OPENAI_API_KEY") if not os.environ.get(name, "").strip()
+    ]
+    if missing:
         raise RuntimeError(
-            "TYPESAFE_API_KEY must be set in .env: Jev reads what the homeowner says on every call."
+            f"{' and '.join(missing)} must be set in .env. TYPESAFE_API_KEY: Jev reads what the "
+            "homeowner says on every call. OPENAI_API_KEY: the writer answers off-script questions."
         )
     jev = Jev(timeout_seconds=JEV_TIMEOUT_SECONDS, max_retries=JEV_RETRIES)
     booking = GoogleBookingLoader(
@@ -75,4 +85,8 @@ def build_call_services(settings: BusinessSettings) -> CallServices:
         google_token_path_from_environment(),
         calendar_id=os.environ.get("GOOGLE_CALENDAR_ID", "").strip() or "primary",
     )
-    return CallServices(ask_jev=jev.ask, booking=booking)
+    writer = OpenAIWriter(
+        model=os.environ.get("WRITER_MODEL", "").strip() or DEFAULT_WRITER_MODEL,
+        timeout_seconds=WRITER_TIMEOUT_SECONDS,
+    )
+    return CallServices(ask_jev=jev.ask, booking=booking, writer=writer)

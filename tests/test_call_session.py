@@ -4,19 +4,27 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from datetime import timedelta
 
 import pytest
-from call_fakes import FIRST_OFFERED_TIME, ScriptedJev, make_session
+from call_fakes import FIRST_OFFERED_TIME, GUARD_CHECK, ScriptedJev, StubWriter, make_session
 from conftest import DANA_PHONE
 from test_booking import FakeCalendar
 
-from lead_bot.call_script import INSURANCE_LINE, PRICE_LINE, opening_greeting
-from lead_bot.call_session import Action, EndCall, Say, is_explicit_opt_out
+from lead_bot.call_script import (
+    CHECKING_LINE,
+    INSURANCE_LINE,
+    PRICE_LINE,
+    QUESTION_FOR_TEAM_LINE,
+    opening_greeting,
+)
+from lead_bot.call_session import Action, CallSession, ContinueTurn, EndCall, Say, is_explicit_opt_out
 from lead_bot.google_calendar import GoogleAuthExpired
 from lead_bot.jev import JevError
 from lead_bot.slots import BusyPeriod, start_from_slot_id
 from lead_bot.store import Store
+from lead_bot.writer import NOT_IN_FACTS, Turn, WriterError
 
 
 def said(actions: list[Action]) -> str:
@@ -291,3 +299,129 @@ def test_hanging_up_after_booking_keeps_the_booking(store: Store) -> None:
     assert store.lead_status(call.lead_id) == "booked"
     assert store.call_result(call.call_id) == "booked"
     assert reasons(store) == []
+
+
+# ---- off-script questions: the writer, then the guard ----
+
+HOW_LONG = "How long does the inspection take?"
+DRAFT = "It takes about an hour."
+PERMISSION_AGAIN = "Do you have a couple of minutes to set up the inspection?"
+
+
+def test_an_off_script_question_says_let_me_check_then_speaks_the_checked_draft(store: Store) -> None:
+    jev = ScriptedJev("other_question", GUARD_CHECK)
+    writer = StubWriter(DRAFT)
+    session, call, _ = make_session(store, jev, writer=writer)
+
+    first_part = session.on_prompt(HOW_LONG)
+    assert first_part == [Say(CHECKING_LINE), ContinueTurn()]
+    answer = session.continue_turn()
+
+    # The draft, then the question the call was waiting on, so the script carries on.
+    assert said(answer) == f"{DRAFT} {PERMISSION_AGAIN}"
+    facts, history = writer.calls[0]
+    assert "12 Saguaro Ln, Mesa AZ" in facts
+    assert history[-1] == Turn("user", HOW_LONG)
+    guard_state = jev.states[-1]
+    assert guard_state == {"FACTS": facts, "HOMEOWNER_QUESTION": HOW_LONG, "REPLY": DRAFT}
+    assert reasons(store) == []  # answered on the call: nothing for the owner
+    [outcome] = session.writer_outcomes
+    assert outcome.spoken and outcome.problems == ()
+
+
+def test_a_draft_the_guard_blocks_is_never_spoken(store: Store) -> None:
+    jev = ScriptedJev("other_question", (GUARD_CHECK, {"price_talk": 0.8}))
+    session, call, _ = make_session(store, jev, writer=StubWriter("Most repairs are around four hundred."))
+    session.on_prompt("Is it expensive to fix a few shingles?")
+
+    answer = said(session.continue_turn())
+
+    assert "four hundred" not in answer
+    assert answer == f"{QUESTION_FOR_TEAM_LINE} {PERMISSION_AGAIN}"
+    assert reasons(store) == ["homeowner_question_for_the_team:price_talk"]
+    assert ("bot", answer) in store.call_transcript(call.call_id)
+
+
+def test_insurance_talk_is_blocked_by_the_backstop_when_jev_scores_it_low(store: Store) -> None:
+    jev = ScriptedJev("other_question", GUARD_CHECK)  # Jev passes it; the word check must not
+    session, _, _ = make_session(store, jev, writer=StubWriter("Hail damage is usually covered."))
+    session.on_prompt("Do you see a lot of hail damage around here?")
+
+    assert said(session.continue_turn()).startswith(QUESTION_FOR_TEAM_LINE)
+    assert reasons(store) == ["homeowner_question_for_the_team:insurance_words"]
+
+
+def test_a_writer_failure_falls_back_without_asking_the_guard(store: Store) -> None:
+    jev = ScriptedJev("other_question")  # no GUARD_CHECK scripted: asking it fails the test
+    session, _, _ = make_session(store, jev, writer=StubWriter(WriterError("insufficient_quota")))
+    session.on_prompt(HOW_LONG)
+
+    assert said(session.continue_turn()).startswith(QUESTION_FOR_TEAM_LINE)
+    assert reasons(store) == ["homeowner_question_for_the_team:writer_failed"]
+
+
+def test_a_draft_is_thrown_away_when_the_guard_cannot_be_reached(store: Store) -> None:
+    jev = ScriptedJev("other_question", JevError("timeout"))
+    session, _, _ = make_session(store, jev, writer=StubWriter(DRAFT))
+    session.on_prompt(HOW_LONG)
+
+    answer = said(session.continue_turn())
+
+    assert DRAFT not in answer
+    assert reasons(store) == ["homeowner_question_for_the_team:guard_unavailable"]
+
+
+def test_without_a_writer_the_fixed_line_is_said_straight_away(store: Store) -> None:
+    session, _, _ = make_session(store, ScriptedJev("other_question"))
+    answer = session.on_prompt(HOW_LONG)
+    assert said(answer) == f"{QUESTION_FOR_TEAM_LINE} {PERMISSION_AGAIN}"
+    assert not any(isinstance(action, ContinueTurn) for action in answer)
+
+
+def test_a_9_pressed_while_the_writer_works_ends_the_call_and_the_draft_is_dropped(store: Store) -> None:
+    session_holder: list[CallSession] = []
+
+    class WriterInterruptedByA9:
+        def write(self, *, facts: str, history: Sequence[Turn], reason: str) -> str:
+            # The homeowner presses 9 while the draft is being written.
+            assert session_holder[0].on_keypress("9") == [EndCall("opted_out")]
+            return DRAFT
+
+    jev = ScriptedJev("other_question", GUARD_CHECK)
+    session, call, _ = make_session(store, jev, writer=WriterInterruptedByA9())
+    session_holder.append(session)
+    session.on_prompt(HOW_LONG)
+
+    assert session.continue_turn() == []
+    assert store.call_result(call.call_id) == "opted_out"
+    assert DRAFT not in [text for _, text in store.call_transcript(call.call_id)]
+
+
+def test_repeat_after_let_me_check_repeats_the_real_question(store: Store) -> None:
+    jev = ScriptedJev("other_question", GUARD_CHECK, "repeat")
+    session, _, _ = make_session(store, jev, writer=StubWriter(DRAFT))
+    session.on_prompt(HOW_LONG)
+    answer = said(session.continue_turn())
+    assert said(session.on_prompt("sorry, what was that?")) == answer
+
+
+def test_a_question_the_facts_dont_answer_gets_the_fixed_line_and_an_owner_alert(store: Store) -> None:
+    """The writer replies NOT_IN_FACTS; code says the deferral, so a person is always told."""
+    jev = ScriptedJev("other_question")  # no GUARD_CHECK: a NOT_IN_FACTS reply isn't checked
+    session, _, _ = make_session(store, jev, writer=StubWriter(NOT_IN_FACTS))
+    session.on_prompt("Do I need to be home for it?")
+
+    assert said(session.continue_turn()) == f"{QUESTION_FOR_TEAM_LINE} {PERMISSION_AGAIN}"
+    assert reasons(store) == ["homeowner_question_for_the_team:not_in_facts"]
+
+
+def test_a_written_phone_number_is_spoken_digit_by_digit(store: Store) -> None:
+    jev = ScriptedJev("other_question", GUARD_CHECK)
+    session, _, _ = make_session(store, jev, writer=StubWriter("You can call us at 480-555-0199."))
+    session.on_prompt("What's your number?")
+
+    answer = said(session.continue_turn())
+
+    assert answer.startswith("You can call us at 4 8 0, 5 5 5, 0 1 9 9.")
+    # The guard checks exactly what is spoken, not the writer's original.
+    assert jev.states[-1]["REPLY"] == "You can call us at 4 8 0, 5 5 5, 0 1 9 9."

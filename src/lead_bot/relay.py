@@ -27,7 +27,7 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-from .call_session import Action, CallServices, CallSession, EndCall, Say
+from .call_session import Action, CallServices, CallSession, ContinueTurn, EndCall, Say
 from .settings import BusinessSettings
 from .store import Store
 
@@ -97,10 +97,15 @@ async def _run_call(websocket: WebSocket, session: CallSession) -> None:
     send_lock = asyncio.Lock()  # the reader and the talker both send; one message at a time
     call_over = asyncio.Event()
 
-    async def perform(actions: list[Action]) -> None:
+    async def perform(actions: list[Action]) -> bool:
+        """Send the actions in order. Returns True when the turn continues (see ContinueTurn).
+
+        The send lock is held only while sending. The rest of a continued turn (the writer and
+        guard, seconds of work) runs outside it, so a 9 pressed meanwhile is sent at once.
+        """
         async with send_lock:
             if call_over.is_set():
-                return
+                return False
             for action in actions:
                 if isinstance(action, Say):
                     await websocket.send_json({"type": "text", "token": action.text, "last": True})
@@ -111,12 +116,17 @@ async def _run_call(websocket: WebSocket, session: CallSession) -> None:
                     # always heard in full. Check on the first real call.
                     handoff_data = json.dumps({"result": action.reason})
                     await websocket.send_json({"type": "end", "handoffData": handoff_data})
-                    return
+                    return False
+                elif isinstance(action, ContinueTurn):
+                    return True
+        return False
 
     async def talker() -> None:
         while not call_over.is_set():
             words = await prompts.get()
-            await perform(await asyncio.to_thread(session.on_prompt, words))
+            actions = await asyncio.to_thread(session.on_prompt, words)
+            while await perform(actions):
+                actions = await asyncio.to_thread(session.continue_turn)
 
     async def reader() -> None:
         while not call_over.is_set():
