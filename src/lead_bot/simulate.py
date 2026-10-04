@@ -24,6 +24,7 @@ import re
 import socket
 import sys
 import threading
+import time
 import xml.etree.ElementTree as ElementTree
 from collections.abc import Mapping
 from dataclasses import replace
@@ -236,15 +237,18 @@ def talk(url: str, opening: str, parameters: dict[str, str], provider_call_id: s
                 prompt = {"type": "prompt", "voicePrompt": words, "lang": "en-US", "last": True}
                 websocket.send(json.dumps(prompt))
                 wait = REPLY_WAIT_SECONDS
-            if print_replies(websocket, wait):
+            if print_replies(websocket, wait, sent_at=time.monotonic()):
                 return
 
 
-def print_replies(websocket: ClientConnection, wait: float) -> bool:
+def print_replies(websocket: ClientConnection, wait: float, sent_at: float) -> bool:
     """Print everything the bot says this turn. Returns True once the bot has hung up.
 
     A turn can be more than one message: a goodbye is a "text" followed by an "end". After the
     first message, anything else from the same turn arrives within moments.
+
+    Each reply shows how long it took. On a real call that's the silence the homeowner hears
+    after they stop talking (plus Twilio's own speech-to-text and text-to-speech time).
     """
     while True:
         try:
@@ -256,7 +260,7 @@ def print_replies(websocket: ClientConnection, wait: float) -> bool:
             return True
         wait = FOLLOW_UP_MESSAGE_WAIT_SECONDS
         if message.get("type") == "text":
-            print(f"BOT: {message['token']}")
+            print(f"BOT ({time.monotonic() - sent_at:.2f}s): {message['token']}")
         elif message.get("type") == "end":
             print(f"[simulator] the bot hung up: {json.loads(message.get('handoffData') or '{}')}")
             return True
