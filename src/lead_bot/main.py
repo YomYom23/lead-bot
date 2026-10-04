@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from .server import create_app
 from .settings import BusinessSettings, database_path_from_environment
 from .store import Store
+from .wiring import build_call_services
 
 load_dotenv()
 
@@ -22,4 +23,4 @@ _settings = BusinessSettings.from_environment()  # stops here, naming what's mis
 _store = Store(database_path_from_environment())
 
 # Module-level `app`: the name fastapi's CLI looks for by default.
-app = create_app(_store, _settings)
+app = create_app(_store, _settings, call_services=build_call_services(_settings))

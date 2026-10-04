@@ -18,7 +18,8 @@ dial the same call twice. But two could reach the same homeowner within seconds,
 duplicate lead's call.
 
 Phase 1 has no phone connection. main() uses DryRunCallPlacer, which logs the call it would
-make and places nothing. Phase 2 swaps in the simulator, and phase 4 swaps in Twilio.
+make and places nothing. lead_bot.simulate runs one dial through these same checks with a
+simulated phone network instead, and phase 4 swaps in Twilio.
 """
 
 from __future__ import annotations

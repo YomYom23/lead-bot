@@ -3,17 +3,30 @@ name = "lead-bot"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-  # The web form now; the call-control endpoints and the live call WebSocket in later phases.
+  # The web form and the live call WebSocket. [standard] brings uvicorn and the websockets
+  # library, which the phone simulator also uses as its client.
   "fastapi[standard]>=0.115,<0.121",
+  # The one-time browser sign-in to Google (google_login.py).
+  "google-auth-oauthlib>=1.2,<2",
+  # Google Calendar requests (google_calendar.py, copied from booking-bot).
+  "httpx2>=2.0.0,<3",
+  "python-dotenv>=1.2.4",
+  # Jev: reads each thing the homeowner says on a call.
+  "typesafe-sdk>=0.7.1,<0.8",
   # Python's zoneinfo needs a timezone database, and Windows doesn't ship one. Calling hours
   # depend on it, so a missing database must be an install error, not a runtime surprise.
-  "python-dotenv>=1.2.4",
   "tzdata>=2026.4",
 ]
 
 [dependency-groups]
 # httpx is what fastapi.testclient needs.
-dev = ["pytest", "mypy", "ruff", "httpx"]
+dev = [
+    "pytest",
+    "mypy",
+    "ruff",
+    "httpx",
+    "httpx2>=2.13.1",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -29,6 +42,12 @@ entrypoint = "lead_bot.main:app"
 [tool.mypy]
 strict = true
 mypy_path = "src"
+
+# google-auth-oauthlib ships no type information (no py.typed marker). Only google_login.py
+# imports it, and only to run the browser sign-in.
+[[tool.mypy.overrides]]
+module = ["google_auth_oauthlib", "google_auth_oauthlib.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 110

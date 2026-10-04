@@ -12,6 +12,7 @@ Times are stored as Unix seconds (UTC) and handed out as timezone-aware datetime
 
 from __future__ import annotations
 
+import secrets
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -61,9 +62,38 @@ CREATE TABLE IF NOT EXISTS calls (
     placed_at        REAL,
     outcome          TEXT,                  -- a CallOutcome, once known
     note             TEXT,                  -- why it was cancelled or failed
+    relay_token      TEXT,                  -- secret the live call must present; set when claimed
+    connected_at     REAL,                  -- when the live conversation connected
+    result           TEXT,                  -- how an answered call ended, e.g. 'booked'
     UNIQUE (lead_id, attempt)               -- the same follow-up can't be scheduled twice
 );
 CREATE INDEX IF NOT EXISTS calls_due ON calls (status, due_at);
+
+-- What was said on each call, in order. The record of what the AI told the homeowner.
+CREATE TABLE IF NOT EXISTS call_turns (
+    turn_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_id  INTEGER NOT NULL REFERENCES calls (call_id),
+    speaker  TEXT NOT NULL,                 -- 'bot', 'homeowner', 'keypad' or 'system'
+    text     TEXT NOT NULL,
+    at       REAL NOT NULL
+);
+
+-- The qualifying answers, one row per lead and question. A later answer replaces an earlier one.
+CREATE TABLE IF NOT EXISTS lead_answers (
+    lead_id     INTEGER NOT NULL REFERENCES leads (lead_id),
+    question    TEXT NOT NULL,              -- e.g. 'active_leak'
+    answer      TEXT NOT NULL,              -- e.g. 'yes'
+    recorded_at REAL NOT NULL,
+    PRIMARY KEY (lead_id, question)
+);
+
+CREATE TABLE IF NOT EXISTS bookings (
+    lead_id    INTEGER PRIMARY KEY REFERENCES leads (lead_id),  -- one inspection per lead
+    call_id    INTEGER NOT NULL REFERENCES calls (call_id),
+    starts_at  REAL NOT NULL,
+    slot_label TEXT NOT NULL,
+    booked_at  REAL NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS do_not_call (
     phone    TEXT PRIMARY KEY,
@@ -79,13 +109,32 @@ CREATE TABLE IF NOT EXISTS owner_alerts (
 );
 """
 
+# Columns added after phase 1. CREATE TABLE IF NOT EXISTS leaves an existing table as it was, so
+# a database made by an earlier version gets these added one by one when the store opens it.
+ADDED_COLUMNS = (
+    ("calls", "relay_token", "TEXT"),
+    ("calls", "connected_at", "REAL"),
+    ("calls", "result", "TEXT"),
+)
+
 # following_up  -> calls are scheduled or in progress
-# answered      -> someone picked up; no more automatic calls (phase 2 refines this)
+# answered      -> someone picked up and the call is under way (or ended without a result)
+# booked        -> an inspection was booked on a call
+# handed_off    -> a person at the business takes over (they asked for one, or the bot couldn't help)
 # unreached     -> every attempt went unanswered; the owner was alerted
 # owner_alerted -> no AI calls at all (no consent, or opted out before); the owner was alerted
 # duplicate     -> the number already had a follow-up running when this form arrived
 # opted_out     -> the number went on the do-not-call list
-LeadStatus = Literal["following_up", "answered", "unreached", "owner_alerted", "duplicate", "opted_out"]
+LeadStatus = Literal[
+    "following_up",
+    "answered",
+    "booked",
+    "handed_off",
+    "unreached",
+    "owner_alerted",
+    "duplicate",
+    "opted_out",
+]
 
 # scheduled -> waiting for due_at;  dialing -> claimed by the dialer, checks running;
 # placed -> handed to the phone provider;  completed -> outcome known;  cancelled -> never dialed
@@ -120,6 +169,22 @@ class DueCall:
     lead_status: str
     consent_given: bool
     on_do_not_call: bool
+    # The secret the live call must present when it connects back to the server. Made when the
+    # call is claimed, so it's stored before the phone can possibly ring.
+    relay_token: str
+
+
+@dataclass(frozen=True)
+class ConnectedCall:
+    """What the live conversation needs to know about the lead it's talking to."""
+
+    call_id: int
+    lead_id: int
+    attempt: int
+    phone: str
+    full_name: str
+    address: str
+    problem: str
 
 
 @dataclass(frozen=True)
@@ -138,6 +203,10 @@ class Store:
             # WAL lets the form server write while the dialer reads, instead of one blocking.
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(SCHEMA)
+            for table, column, column_type in ADDED_COLUMNS:
+                existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+                if column not in existing:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
         finally:
             connection.close()
 
@@ -247,6 +316,10 @@ class Store:
             row = connection.execute("SELECT status FROM leads WHERE lead_id = ?", (lead_id,)).fetchone()
         return None if row is None else str(row["status"])
 
+    def add_owner_alert(self, lead_id: int, reason: str, now: datetime) -> None:
+        with self._write_transaction() as connection:
+            _add_owner_alert(connection, lead_id, reason, now)
+
     # ---- calls ----
 
     def claim_due_call(self, now: datetime) -> DueCall | None:
@@ -272,7 +345,11 @@ class Store:
             ).fetchone()
             if row is None:
                 return None
-            connection.execute("UPDATE calls SET status = 'dialing' WHERE call_id = ?", (row["call_id"],))
+            relay_token = secrets.token_urlsafe(24)
+            connection.execute(
+                "UPDATE calls SET status = 'dialing', relay_token = ? WHERE call_id = ?",
+                (relay_token, row["call_id"]),
+            )
             return DueCall(
                 call_id=row["call_id"],
                 lead_id=row["lead_id"],
@@ -282,13 +359,21 @@ class Store:
                 lead_status=row["lead_status"],
                 consent_given=row["consent_given"] == 1,  # NULL (no consent row) -> False
                 on_do_not_call=row["on_do_not_call"] == 1,
+                relay_token=relay_token,
             )
 
     def mark_call_placed(self, call_id: int, provider_call_id: str, placed_at: datetime) -> None:
+        """Record the provider's id for a call it accepted.
+
+        The live conversation can connect before this runs (the simulator always does, and Twilio
+        could if the homeowner answers on the first ring), so the id is saved whatever the
+        status, and only a call still 'dialing' moves to 'placed'.
+        """
         with self._write_transaction() as connection:
             connection.execute(
-                "UPDATE calls SET status = 'placed', provider_call_id = ?, placed_at = ? "
-                "WHERE call_id = ? AND status = 'dialing'",
+                "UPDATE calls SET provider_call_id = ?, placed_at = COALESCE(placed_at, ?), "
+                "status = CASE WHEN status = 'dialing' THEN 'placed' ELSE status END "
+                "WHERE call_id = ?",
                 (provider_call_id, placed_at.timestamp(), call_id),
             )
 
@@ -387,10 +472,153 @@ class Store:
             rows = connection.execute("SELECT call_id FROM calls WHERE status = 'dialing'").fetchall()
         return [row["call_id"] for row in rows]
 
+    def next_due_call_time(self) -> datetime | None:
+        """When the earliest scheduled call is due, or None if none is scheduled."""
+        with self._read() as connection:
+            row = connection.execute(
+                "SELECT MIN(due_at) AS due_at FROM calls WHERE status = 'scheduled'"
+            ).fetchone()
+        return None if row["due_at"] is None else datetime.fromtimestamp(row["due_at"], UTC)
+
+    # ---- the live conversation ----
+
+    def connect_call(self, call_id: int, relay_token: str, now: datetime) -> ConnectedCall | None:
+        """Let a live conversation start on this call, once. Returns None to refuse it.
+
+        Refused when the token is wrong, the call isn't one that was just placed, it already
+        connected once, or the lead stopped being followed up while the phone rang (they opted
+        out another way, say). The lead's details are only handed out after these checks pass,
+        because the conversation speaks them aloud.
+
+        Accepting marks the call answered, which also stops the follow-up schedule.
+        """
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT calls.call_id, calls.lead_id, calls.attempt, calls.relay_token, "
+                "calls.connected_at, calls.status AS call_status, leads.status AS lead_status, "
+                "leads.phone, leads.full_name, leads.address, leads.problem "
+                "FROM calls JOIN leads ON leads.lead_id = calls.lead_id WHERE calls.call_id = ?",
+                (call_id,),
+            ).fetchone()
+            if row is None or row["relay_token"] is None:
+                return None
+            # compare_digest takes the same time however much of the token matches, so the
+            # response time can't be used to guess it one character at a time.
+            if not secrets.compare_digest(str(row["relay_token"]), relay_token):
+                return None
+            # 'dialing' too: the provider can connect before the dialer has written 'placed'.
+            if row["call_status"] not in ("dialing", "placed") or row["connected_at"] is not None:
+                return None
+            if row["lead_status"] != "following_up":
+                return None
+            connection.execute(
+                "UPDATE calls SET status = 'completed', outcome = 'answered', connected_at = ? "
+                "WHERE call_id = ?",
+                (now.timestamp(), call_id),
+            )
+            connection.execute("UPDATE leads SET status = 'answered' WHERE lead_id = ?", (row["lead_id"],))
+            return ConnectedCall(
+                call_id=row["call_id"],
+                lead_id=row["lead_id"],
+                attempt=row["attempt"],
+                phone=row["phone"],
+                full_name=row["full_name"],
+                address=row["address"],
+                problem=row["problem"],
+            )
+
+    def add_call_turn(self, call_id: int, speaker: str, text: str, now: datetime) -> None:
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO call_turns (call_id, speaker, text, at) VALUES (?, ?, ?, ?)",
+                (call_id, speaker, text, now.timestamp()),
+            )
+
+    def call_transcript(self, call_id: int) -> list[tuple[str, str]]:
+        """(speaker, text) for every turn of a call, in order."""
+        with self._read() as connection:
+            rows = connection.execute(
+                "SELECT speaker, text FROM call_turns WHERE call_id = ? ORDER BY turn_id", (call_id,)
+            ).fetchall()
+        return [(row["speaker"], row["text"]) for row in rows]
+
+    def save_answer(self, lead_id: int, question: str, answer: str, now: datetime) -> None:
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO lead_answers (lead_id, question, answer, recorded_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (lead_id, question) DO UPDATE SET answer = excluded.answer, "
+                "recorded_at = excluded.recorded_at",
+                (lead_id, question, answer, now.timestamp()),
+            )
+
+    def lead_answers(self, lead_id: int) -> dict[str, str]:
+        with self._read() as connection:
+            rows = connection.execute(
+                "SELECT question, answer FROM lead_answers WHERE lead_id = ?", (lead_id,)
+            ).fetchall()
+        return {row["question"]: row["answer"] for row in rows}
+
+    def record_booking(
+        self, lead_id: int, call_id: int, starts_at: datetime, slot_label: str, now: datetime
+    ) -> None:
+        with self._write_transaction() as connection:
+            # OR REPLACE: booking.py makes at most one calendar event per lead, and a retry that
+            # finds it confirms the same time, so a second row would only repeat the first.
+            connection.execute(
+                "INSERT OR REPLACE INTO bookings (lead_id, call_id, starts_at, slot_label, booked_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (lead_id, call_id, starts_at.timestamp(), slot_label, now.timestamp()),
+            )
+
+    def booking_label(self, lead_id: int) -> str | None:
+        with self._read() as connection:
+            row = connection.execute(
+                "SELECT slot_label FROM bookings WHERE lead_id = ?", (lead_id,)
+            ).fetchone()
+        return None if row is None else str(row["slot_label"])
+
+    def finish_call(
+        self,
+        call_id: int,
+        result: str,
+        now: datetime,
+        lead_status: LeadStatus | None = None,
+        owner_alert: str | None = None,
+    ) -> None:
+        """Record how an answered call ended. Only the first finish for a call counts.
+
+        lead_status replaces 'answered' only: a lead that opted out during the call stays
+        opted out.
+        """
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT lead_id FROM calls WHERE call_id = ? AND result IS NULL", (call_id,)
+            ).fetchone()
+            if row is None:
+                return
+            connection.execute("UPDATE calls SET result = ? WHERE call_id = ?", (result, call_id))
+            if lead_status is not None:
+                connection.execute(
+                    "UPDATE leads SET status = ? WHERE lead_id = ? AND status = 'answered'",
+                    (lead_status, row["lead_id"]),
+                )
+            if owner_alert is not None:
+                _add_owner_alert(connection, row["lead_id"], owner_alert, now)
+
+    def call_result(self, call_id: int) -> str | None:
+        with self._read() as connection:
+            row = connection.execute("SELECT result FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+        return None if row is None or row["result"] is None else str(row["result"])
+
     # ---- do-not-call ----
 
     def add_to_do_not_call(self, phone: str, source: str, now: datetime) -> None:
-        """Opt a number out. Its scheduled calls are cancelled and its leads stop following up."""
+        """Opt a number out. Its scheduled calls are cancelled and its leads stop following up.
+
+        'answered' is included because an opt-out often happens during the call itself. A lead
+        that was already booked keeps that status: the inspection stands, there are just no more
+        calls.
+        """
         with self._write_transaction() as connection:
             connection.execute(
                 "INSERT OR IGNORE INTO do_not_call (phone, added_at, source) VALUES (?, ?, ?)",
@@ -402,7 +630,9 @@ class Store:
                 (phone,),
             )
             connection.execute(
-                "UPDATE leads SET status = 'opted_out' WHERE phone = ? AND status = 'following_up'", (phone,)
+                "UPDATE leads SET status = 'opted_out' "
+                "WHERE phone = ? AND status IN ('following_up', 'answered')",
+                (phone,),
             )
 
     def is_on_do_not_call(self, phone: str) -> bool:

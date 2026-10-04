@@ -24,8 +24,10 @@ from typing import Annotated
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse
 
+from .call_session import CallServices
 from .consent import CONSENT_VERSION, ConsentEvidence, consent_text
 from .leads import PROBLEM_LABELS, InvalidLeadForm, parse_lead_form, pretty_phone
+from .relay import add_relay_route
 from .settings import BusinessSettings
 from .store import AddedLead, Store
 from .timing import clock_label, utc_now
@@ -91,8 +93,17 @@ $problem_options
 </form>""")
 
 
-def create_app(store: Store, settings: BusinessSettings, clock: Callable[[], datetime] = utc_now) -> FastAPI:
-    """Build the app. Store, settings and clock are passed in so tests can control them."""
+def create_app(
+    store: Store,
+    settings: BusinessSettings,
+    clock: Callable[[], datetime] = utc_now,
+    call_services: CallServices | None = None,
+) -> FastAPI:
+    """Build the app. Store, settings and clock are passed in so tests can control them.
+
+    Without call_services there's no live-call endpoint: the form works on its own, which is all
+    the form tests need.
+    """
     app = FastAPI(title="lead-bot")
 
     def page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
@@ -191,6 +202,8 @@ def create_app(store: Store, settings: BusinessSettings, clock: Callable[[], dat
         # Browsers ask for this on every page. A plain 204 keeps it out of the error log.
         return Response(status_code=204)
 
+    if call_services is not None:
+        add_relay_route(app, store, settings, call_services, clock)
     return app
 
 
