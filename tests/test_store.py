@@ -1,5 +1,6 @@
 # lead-bot/tests/test_store.py
-# The store: one-transaction intake, the consent record, follow-up scheduling, opt-outs.
+# The store: one-transaction intake, the consent record, opening texts and reminders, incoming
+# texts in order, opt-outs, and recovery after a crash.
 from __future__ import annotations
 
 import sqlite3
@@ -13,28 +14,49 @@ from conftest import DANA_PHONE, HOURS, MONDAY_10AM, make_consent, make_lead, ph
 
 from lead_bot.leads import IntakeDecision, decide_intake
 from lead_bot.store import Store
+from lead_bot.turn_data import TurnOutcome
 
 
-def test_a_consenting_lead_gets_one_call_due_now(store: Store) -> None:
+def text_counts(store: Store) -> dict[str, int]:
+    return store.counts()["texts_out"]
+
+
+def add_do_not_call_row_by_hand(database_path: Path, phone: str) -> None:
+    """A do-not-call entry made outside Store, as the owner might with a database tool."""
+    connection = sqlite3.connect(database_path)
+    with connection:
+        connection.execute(
+            "INSERT INTO do_not_call (phone, added_at, source) VALUES (?, ?, 'owner')",
+            (phone, MONDAY_10AM.timestamp()),
+        )
+    connection.close()
+
+
+# ---- intake ----
+
+
+def test_a_consenting_lead_gets_its_first_text_due_now(store: Store) -> None:
     added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
-    assert added.decision == "call"
-    assert added.first_call_due == MONDAY_10AM
+    assert added.decision == "text"
+    assert added.first_text_due == MONDAY_10AM
     assert store.lead_status(added.lead_id) == "following_up"
-    assert store.counts()["calls"] == {"scheduled": 1}
+    assert [due.attempt for due in store.due_openings(MONDAY_10AM)] == [1]
     assert store.owner_alerts() == []
 
 
-def test_a_lead_at_night_is_called_at_eight(store: Store) -> None:
+def test_a_lead_at_night_is_texted_at_eight(store: Store) -> None:
     added = store.add_lead(make_lead(), make_consent(), phoenix(2026, 10, 5, 22, 30), HOURS)
-    assert added.first_call_due == phoenix(2026, 10, 6, 8, 0)
+    assert added.first_text_due == phoenix(2026, 10, 6, 8, 0)
+    assert store.due_openings(phoenix(2026, 10, 6, 7, 59)) == []
+    assert len(store.due_openings(phoenix(2026, 10, 6, 8, 0))) == 1
 
 
 def test_no_consent_schedules_nothing_and_alerts_the_owner(store: Store) -> None:
     added = store.add_lead(make_lead(), make_consent(given=False), MONDAY_10AM, HOURS)
-    assert added.decision == "no_call_consent"
-    assert added.first_call_due is None
-    assert store.counts()["calls"] == {}
-    assert [alert.reason for alert in store.owner_alerts()] == ["no_call_consent"]
+    assert added.decision == "no_text_consent"
+    assert added.first_text_due is None
+    assert store.due_openings(MONDAY_10AM + timedelta(days=30)) == []
+    assert [alert.reason for alert in store.owner_alerts()] == ["no_text_consent"]
 
 
 def test_the_consent_record_keeps_what_the_person_saw(store: Store, tmp_path: Path) -> None:
@@ -48,21 +70,21 @@ def test_the_consent_record_keeps_what_the_person_saw(store: Store, tmp_path: Pa
     given, version, text_shown, ip_address, recorded_at = row
     assert given == 1
     assert version == make_consent().version
-    assert "Desert Ridge Roofing LLC may call me" in text_shown
-    assert "artificial (AI-generated) voice" in text_shown
+    assert "Desert Ridge Roofing LLC may send automated text messages" in text_shown
     assert "not a condition of buying anything" in text_shown
+    assert "STOP to opt out" in text_shown
     assert ip_address == "203.0.113.7"
     assert recorded_at == MONDAY_10AM.timestamp()
 
 
-def test_a_second_form_from_the_same_number_starts_no_second_sequence(store: Store) -> None:
+def test_a_second_form_from_the_same_number_starts_no_second_conversation(store: Store) -> None:
     store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
     second = store.add_lead(make_lead(), make_consent(), MONDAY_10AM + timedelta(minutes=5), HOURS)
     assert second.decision == "already_in_follow_up"
-    assert store.counts()["calls"] == {"scheduled": 1}
+    assert len(store.due_openings(MONDAY_10AM + timedelta(minutes=5))) == 1
 
 
-def test_simultaneous_duplicate_forms_both_succeed_and_start_one_sequence(
+def test_simultaneous_duplicate_forms_both_succeed_and_start_one_conversation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Two submissions of the same number at the same moment, from two threads. A pause between
@@ -92,94 +114,203 @@ def test_simultaneous_duplicate_forms_both_succeed_and_start_one_sequence(
         thread.start()
     for thread in threads:
         thread.join(timeout=10)
-    # Neither submission is lost, and only one of them starts calls.
-    assert sorted(results) == ["already_in_follow_up", "call"]
-    assert Store(database_path).counts()["calls"] == {"scheduled": 1}
+    # Neither submission is lost, and only one of them starts texting.
+    assert sorted(results) == ["already_in_follow_up", "text"]
+    assert len(Store(database_path).due_openings(MONDAY_10AM)) == 1
 
 
 def test_an_opted_out_number_is_never_scheduled_again(store: Store) -> None:
     store.add_to_do_not_call(DANA_PHONE, "test", MONDAY_10AM)
     added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
     assert added.decision == "previously_opted_out"
-    assert store.counts()["calls"] == {}
+    assert store.due_openings(MONDAY_10AM) == []
     assert [alert.reason for alert in store.owner_alerts()] == ["previously_opted_out"]
 
 
-def test_opting_out_cancels_scheduled_calls_and_stops_the_lead(store: Store) -> None:
+# ---- opening texts and reminders ----
+
+
+def queue_first_text(store: Store, lead_id: int) -> None:
+    assert store.queue_opening_text(lead_id, 1, "first text", MONDAY_10AM, HOURS) == "queued"
+
+
+def test_queuing_the_first_text_schedules_the_first_reminder(store: Store) -> None:
     added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
-    store.add_to_do_not_call(DANA_PHONE, "pressed 9", MONDAY_10AM)
-    assert store.counts()["calls"] == {"cancelled": 1}
+    queue_first_text(store, added.lead_id)
+    assert text_counts(store) == {"queued": 1}
+    assert store.due_openings(MONDAY_10AM + timedelta(hours=1, minutes=59)) == []
+    assert [due.attempt for due in store.due_openings(MONDAY_10AM + timedelta(hours=2))] == [2]
+
+
+def test_the_same_opening_text_is_queued_only_once(store: Store) -> None:
+    # Two worker passes (or two workers) both saw attempt 1 due; only one may queue it.
+    added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
+    queue_first_text(store, added.lead_id)
+    assert store.queue_opening_text(added.lead_id, 1, "first text", MONDAY_10AM, HOURS) == "not_due"
+    assert text_counts(store) == {"queued": 1}
+
+
+def test_an_opening_text_outside_texting_hours_is_moved_to_the_morning(store: Store) -> None:
+    added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
+    late = phoenix(2026, 10, 5, 21, 0)  # the worker was down until after the window closed
+    assert store.queue_opening_text(added.lead_id, 1, "first text", late, HOURS) == "rescheduled"
+    assert text_counts(store) == {}
+    assert len(store.due_openings(phoenix(2026, 10, 6, 8, 0))) == 1
+
+
+def test_an_opening_text_is_not_queued_once_the_number_opted_out(store: Store) -> None:
+    added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
+    store.add_to_do_not_call(DANA_PHONE, "test", MONDAY_10AM)
+    assert store.queue_opening_text(added.lead_id, 1, "first text", MONDAY_10AM, HOURS) == "not_due"
+    assert text_counts(store) == {}
     assert store.lead_status(added.lead_id) == "opted_out"
-    assert store.is_on_do_not_call(DANA_PHONE)
 
 
-# ---- outcomes and follow-ups ----
-
-
-def claim_and_place(store: Store, now_minutes: int = 0) -> int:
-    now = MONDAY_10AM + timedelta(minutes=now_minutes)
-    due_call = store.claim_due_call(now)
-    assert due_call is not None
-    store.mark_call_placed(due_call.call_id, f"CA{due_call.call_id}", now)
-    return due_call.call_id
-
-
-def test_no_answer_schedules_the_next_attempt(store: Store) -> None:
-    store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
-    call_id = claim_and_place(store)
-    next_due = store.record_call_outcome(call_id, "no_answer", MONDAY_10AM + timedelta(minutes=1), HOURS)
-    assert next_due == MONDAY_10AM + timedelta(hours=2)
-    assert store.counts()["calls"] == {"completed": 1, "scheduled": 1}
-
-
-def test_a_repeated_status_update_schedules_no_extra_call(store: Store) -> None:
-    # Phone providers retry status updates. The second one must change nothing.
-    store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
-    call_id = claim_and_place(store)
-    store.record_call_outcome(call_id, "no_answer", MONDAY_10AM + timedelta(minutes=1), HOURS)
-    repeat = store.record_call_outcome(call_id, "no_answer", MONDAY_10AM + timedelta(minutes=2), HOURS)
-    assert repeat is None
-    assert store.counts()["calls"] == {"completed": 1, "scheduled": 1}
-
-
-def test_an_answered_call_ends_the_follow_ups(store: Store) -> None:
+def test_a_do_not_call_row_added_by_hand_still_stops_the_next_opening_text(
+    store: Store, tmp_path: Path
+) -> None:
+    # The owner (or a future import) adds the number straight into the table, skipping the
+    # helper that would also stop the reminders. The check when queuing still catches it.
     added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
-    call_id = claim_and_place(store)
-    assert store.record_call_outcome(call_id, "answered", MONDAY_10AM, HOURS) is None
-    assert store.lead_status(added.lead_id) == "answered"
-    assert store.counts()["calls"] == {"completed": 1}
+    add_do_not_call_row_by_hand(tmp_path / "leads.db", DANA_PHONE)
+    assert store.queue_opening_text(added.lead_id, 1, "first text", MONDAY_10AM, HOURS) == "stopped"
+    assert text_counts(store) == {}
+    assert store.lead_status(added.lead_id) == "opted_out"
 
 
-def test_after_four_unanswered_calls_the_owner_takes_over(store: Store) -> None:
+def test_any_reply_stops_the_reminders(store: Store) -> None:
+    added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
+    queue_first_text(store, added.lead_id)
+    store.record_incoming_text(DANA_PHONE, "yes", "SMIN1", MONDAY_10AM + timedelta(minutes=5))
+    incoming = store.claim_incoming_text(MONDAY_10AM + timedelta(minutes=5))
+    assert incoming is not None
+    store.save_turn(incoming.text_id, added.lead_id, TurnOutcome("leak", (), 0, 0), MONDAY_10AM)
+    assert store.due_openings(MONDAY_10AM + timedelta(days=10)) == []
+    assert store.lead_status(added.lead_id) == "in_conversation"
+
+
+def test_after_every_opening_text_goes_unanswered_the_owner_is_told(store: Store) -> None:
     added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
     now = MONDAY_10AM
-    for _ in range(4):
-        due_call = store.claim_due_call(now + timedelta(days=10))  # far enough ahead for any due time
-        assert due_call is not None
-        store.mark_call_placed(due_call.call_id, "CA", now)
-        next_due = store.record_call_outcome(due_call.call_id, "no_answer", now, HOURS)
-        now = next_due if next_due is not None else now
+    for attempt in range(1, 5):
+        due = store.due_openings(now + timedelta(days=10))
+        assert [opening.attempt for opening in due] == [attempt]
+        assert store.queue_opening_text(added.lead_id, attempt, f"text {attempt}", now, HOURS) == "queued"
+        now += timedelta(days=1, hours=1)
+    assert store.due_openings(now + timedelta(days=30)) == []
+    store.close_quiet_conversations(now + timedelta(days=2), quiet_for=timedelta(hours=24))
     assert store.lead_status(added.lead_id) == "unreached"
-    assert store.counts()["calls"] == {"completed": 4}
-    assert [alert.reason for alert in store.owner_alerts()] == ["not_reached_after_all_attempts"]
+    assert [alert.reason for alert in store.owner_alerts()] == ["no_reply_to_any_text"]
 
 
-def test_an_opt_out_during_the_call_wins_over_its_no_answer_status(store: Store) -> None:
-    # The opt-out arrives first; the provider's "call ended" update arrives after. No new call.
+# ---- incoming texts ----
+
+
+def test_the_same_incoming_message_saved_twice_is_answered_once(store: Store) -> None:
+    # Twilio sends the webhook again when our answer was slow. The second copy changes nothing.
     store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
-    call_id = claim_and_place(store)
-    store.add_to_do_not_call(DANA_PHONE, "pressed 9", MONDAY_10AM)
-    assert store.record_call_outcome(call_id, "no_answer", MONDAY_10AM, HOURS) is None
-    assert store.counts()["calls"] == {"completed": 1}
+    assert store.record_incoming_text(DANA_PHONE, "yes", "SMIN1", MONDAY_10AM) is not None
+    assert store.record_incoming_text(DANA_PHONE, "yes", "SMIN1", MONDAY_10AM) is None
+    assert store.claim_incoming_text(MONDAY_10AM) is not None
+    assert store.claim_incoming_text(MONDAY_10AM) is None
 
 
-def test_a_call_is_claimed_only_once(store: Store) -> None:
+def test_two_quick_texts_from_one_number_are_answered_in_order(store: Store) -> None:
+    added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
+    store.record_incoming_text(DANA_PHONE, "first", "SMIN1", MONDAY_10AM)
+    store.record_incoming_text(DANA_PHONE, "second", "SMIN2", MONDAY_10AM)
+    first = store.claim_incoming_text(MONDAY_10AM)
+    assert first is not None and first.body == "first"
+    # The second waits while the first is being handled, so it sees what the first changed.
+    assert store.claim_incoming_text(MONDAY_10AM) is None
+    store.save_turn(first.text_id, added.lead_id, TurnOutcome("leak", (), 0, 0), MONDAY_10AM)
+    second = store.claim_incoming_text(MONDAY_10AM)
+    assert second is not None and second.body == "second"
+    assert second.conversation is not None and second.conversation.stage == "leak"
+    assert [turn.text for turn in second.history] == ["first"]
+
+
+def test_a_text_retried_later_is_not_claimed_before_then(store: Store) -> None:
     store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
-    assert store.claim_due_call(MONDAY_10AM) is not None
-    assert store.claim_due_call(MONDAY_10AM) is None
+    store.record_incoming_text(DANA_PHONE, "yes", "SMIN1", MONDAY_10AM)
+    incoming = store.claim_incoming_text(MONDAY_10AM)
+    assert incoming is not None and incoming.tries == 1
+    store.retry_incoming_later(incoming.text_id, MONDAY_10AM + timedelta(minutes=1))
+    assert store.claim_incoming_text(MONDAY_10AM + timedelta(seconds=59)) is None
+    again = store.claim_incoming_text(MONDAY_10AM + timedelta(minutes=1))
+    assert again is not None and again.tries == 2
 
 
-def test_a_call_is_not_claimed_before_it_is_due(store: Store) -> None:
-    store.add_lead(make_lead(), make_consent(), phoenix(2026, 10, 5, 22, 0), HOURS)  # due 8:00 tomorrow
-    assert store.claim_due_call(phoenix(2026, 10, 6, 7, 59)) is None
-    assert store.claim_due_call(phoenix(2026, 10, 6, 8, 0)) is not None
+def test_a_text_from_an_unknown_number_has_no_conversation(store: Store) -> None:
+    store.record_incoming_text("+15550000000", "who is this?", "SMIN1", MONDAY_10AM)
+    incoming = store.claim_incoming_text(MONDAY_10AM)
+    assert incoming is not None
+    assert incoming.conversation is None
+    assert incoming.history == []
+
+
+# ---- opt-outs ----
+
+
+def test_opting_out_cancels_queued_texts_and_stops_the_lead(store: Store) -> None:
+    added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
+    queue_first_text(store, added.lead_id)
+    store.add_to_do_not_call(DANA_PHONE, "replied STOP", MONDAY_10AM)
+    assert text_counts(store) == {"cancelled": 1}
+    assert store.lead_status(added.lead_id) == "opted_out"
+    assert store.conversation_result(added.lead_id) == "opted_out"
+    assert store.is_on_do_not_call(DANA_PHONE)
+    assert store.due_openings(MONDAY_10AM + timedelta(days=30)) == []
+
+
+def test_an_opt_out_turn_queues_only_the_confirmation(store: Store) -> None:
+    added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
+    store.record_incoming_text(DANA_PHONE, "please stop texting me", "SMIN1", MONDAY_10AM)
+    incoming = store.claim_incoming_text(MONDAY_10AM)
+    assert incoming is not None
+    outcome = TurnOutcome(
+        "address",
+        (),
+        0,
+        0,
+        replies=["a reply that must not go out"],
+        stop_confirmation="You're opted out.",
+        do_not_contact_source="asked to stop",
+        close_conversation=True,
+        result="opted_out",
+    )
+    store.save_turn(incoming.text_id, added.lead_id, outcome, MONDAY_10AM)
+    outgoing = store.claim_queued_text()
+    assert outgoing is not None
+    assert (outgoing.kind, outgoing.body) == ("stop_confirmation", "You're opted out.")
+    assert store.claim_queued_text() is None
+
+
+# ---- sending and recovery ----
+
+
+def test_a_queued_text_is_claimed_once(store: Store) -> None:
+    added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
+    queue_first_text(store, added.lead_id)
+    assert store.claim_queued_text() is not None
+    assert store.claim_queued_text() is None
+
+
+def test_after_a_crash_a_half_sent_text_is_never_resent(store: Store) -> None:
+    # The worker stopped between claiming the text and recording the send. Twilio may have it,
+    # so it's marked unknown and the owner checks; sending again could deliver it twice.
+    added = store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
+    queue_first_text(store, added.lead_id)
+    assert store.claim_queued_text() is not None
+    assert store.mark_interrupted_sends_unknown(MONDAY_10AM) == 1
+    assert text_counts(store) == {"unknown": 1}
+    assert store.claim_queued_text() is None
+    assert [alert.reason for alert in store.owner_alerts()] == ["text_may_not_have_sent"]
+
+
+def test_after_a_crash_a_half_answered_text_is_answered_again(store: Store) -> None:
+    store.add_lead(make_lead(), make_consent(), MONDAY_10AM, HOURS)
+    store.record_incoming_text(DANA_PHONE, "yes", "SMIN1", MONDAY_10AM)
+    assert store.claim_incoming_text(MONDAY_10AM) is not None
+    assert store.requeue_interrupted_incoming() == 1
+    assert store.claim_incoming_text(MONDAY_10AM) is not None

@@ -34,11 +34,12 @@ MAX_ADDRESS_LENGTH = 200
 PHONE_CHARACTERS = re.compile(r"[0-9 ()+.\-]+")
 
 # What happens to a new lead:
-#   call                  -> the AI calls them (they consented, and nothing stops it)
-#   previously_opted_out  -> no AI call; the owner is alerted to decide whether to call personally
-#   no_call_consent       -> no AI call; the owner is alerted to call personally
-#   already_in_follow_up  -> the same number is already being called; this lead is just recorded
-IntakeDecision = Literal["call", "previously_opted_out", "no_call_consent", "already_in_follow_up"]
+#   text                  -> the bot texts them (they consented, and nothing stops it)
+#   previously_opted_out  -> no texts; the owner is alerted to decide whether to call personally
+#   no_text_consent       -> no texts; the owner is alerted to call personally
+#   already_in_follow_up  -> the same number already has a conversation going; this lead is just
+#                            recorded
+IntakeDecision = Literal["text", "previously_opted_out", "no_text_consent", "already_in_follow_up"]
 
 
 class InvalidLeadForm(ValueError):
@@ -99,20 +100,20 @@ def pretty_phone(e164_phone: str) -> str:
 def decide_intake(consent_given: bool, on_do_not_call: bool, already_in_follow_up: bool) -> IntakeDecision:
     """Pure rule for a new lead. The order of the checks is the policy:
 
-    1. A number on the do-not-call list is never called by the AI again, even if this form has
+    1. A number on the do-not-call list is never texted by the bot again, even if this form has
        the box ticked. Whether new consent overrides an earlier opt-out is a question for a
        lawyer; until then the owner decides and calls personally.
-    2. A number already being called gets no second sequence: a homeowner who submits twice
-       would otherwise get every call twice.
-    3. Without the ticked consent box there is no AI call at all.
+    2. A number that already has a conversation going gets no second one: a homeowner who
+       submits twice would otherwise get every text twice.
+    3. Without the ticked consent box there are no texts at all.
     """
     if on_do_not_call:
         return "previously_opted_out"
     if already_in_follow_up:
         return "already_in_follow_up"
     if not consent_given:
-        return "no_call_consent"
-    return "call"
+        return "no_text_consent"
+    return "text"
 
 
 def _problem_from_form(value: str) -> ProblemType:

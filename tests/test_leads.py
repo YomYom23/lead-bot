@@ -66,12 +66,12 @@ def test_each_bad_field_gets_its_own_message(
 # ---- intake rule ----
 
 
-def test_consent_and_nothing_in_the_way_means_a_call() -> None:
-    assert decide_intake(consent_given=True, on_do_not_call=False, already_in_follow_up=False) == "call"
+def test_consent_and_nothing_in_the_way_means_a_text() -> None:
+    assert decide_intake(consent_given=True, on_do_not_call=False, already_in_follow_up=False) == "text"
 
 
-def test_no_consent_means_no_ai_call() -> None:
-    assert decide_intake(False, False, False) == "no_call_consent"
+def test_no_consent_means_no_automated_texts() -> None:
+    assert decide_intake(False, False, False) == "no_text_consent"
 
 
 def test_do_not_call_beats_a_fresh_tick() -> None:
@@ -85,5 +85,5 @@ def test_do_not_call_beats_a_running_follow_up() -> None:
     assert decide_intake(True, True, True) == "previously_opted_out"
 
 
-def test_a_second_form_for_a_number_already_being_called_starts_nothing() -> None:
+def test_a_second_form_for_a_number_already_being_texted_starts_nothing() -> None:
     assert decide_intake(True, False, True) == "already_in_follow_up"

@@ -1,17 +1,21 @@
 # lead-bot/src/lead_bot/consent.py
-"""The call-consent wording on the lead form, and the evidence kept for each lead.
+"""The text-message consent wording on the lead form, and the evidence kept for each lead.
 
-The FCC ruled in February 2024 that an AI voice is an "artificial voice" under the federal
-robocall law. Telemarketing calls with one need the person's prior express written consent
-(47 CFR 64.1200(a)(2)). Per (f)(9), that is a signed agreement (an electronic signature counts)
-which must:
-  - authorize the seller, by name, to call with an artificial voice,
+The FCC treats a text as a "call" under the federal robocall law (the TCPA). Texts sent with
+automated technology to sell something are treated here as needing the person's prior express
+written consent (47 CFR 64.1200(a)(2)), the cautious reading. Per (f)(9), that is a signed
+agreement (an electronic signature counts) which must:
+  - authorize the seller, by name, to send the messages,
   - name the phone number it covers,
   - disclose that signing isn't a condition of buying anything.
-CONSENT_TEMPLATE covers each point; the comments beside it say which.
 
-Have a telemarketing lawyer review the wording before a real client uses it. The research
-paper this project follows says the same.
+Twilio's toll-free verification reviews the opt-in too. Its opt-in guide expects the form to say
+what the texts are about, that frequency varies, that message and data rates may apply, and how
+to get help or opt out (HELP and STOP). CONSENT_TEMPLATE covers each point; the comments beside
+it say which.
+
+Have a telemarketing lawyer review the wording before a real client uses it. The research paper
+this project follows says the same.
 
 The wording is versioned. Each lead's record stores the exact text they were shown, so a later
 change can never alter what an earlier lead agreed to. Change CONSENT_VERSION with any edit to
@@ -23,19 +27,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from string import Template
 
-CONSENT_VERSION = "call-consent-2026-10-02"
+CONSENT_VERSION = "text-consent-2026-10-04"
 
 CONSENT_TEMPLATE = Template(
-    # "$business_name may call me": names the seller.
-    # "at the phone number I entered above": the number covered.
-    # "artificial (AI-generated) voice" and "automated technology": the call types covered.
+    # "$business_name may send": names the seller.
+    # "to the mobile number I entered above": the number covered.
+    # "automated text messages, including messages written with the help of AI": what kind.
+    # "about my roof inspection request and scheduling": what the texts are for.
     # "not a condition of buying anything": the required disclosure.
-    # Transcription and the opt-out are disclosed here too, so nothing on the call surprises them.
-    "I agree that $business_name may call me at the phone number I entered above, including "
-    "calls placed with automated technology that use an artificial (AI-generated) voice, to "
-    "discuss roofing services and schedule an inspection. Calls may be transcribed. Agreeing is "
-    "not a condition of buying anything. I can stop the calls at any time by pressing 9 or "
-    'saying "stop" during a call.'
+    # Frequency, rates, HELP and STOP: what Twilio's opt-in review looks for.
+    "I agree that $business_name may send automated text messages, including messages written "
+    "with the help of AI, to the mobile number I entered above about my roof inspection request "
+    "and scheduling. Agreeing is not a condition of buying anything. Message frequency varies. "
+    "Msg & data rates may apply. Reply HELP for help or STOP to opt out at any time."
 )
 
 

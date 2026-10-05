@@ -1,5 +1,5 @@
 # lead-bot/tests/test_timing.py
-# Calling hours and the follow-up schedule. Fixed times, no real clock.
+# Texting hours and the reminder schedule. Fixed times, no real clock.
 from __future__ import annotations
 
 from datetime import UTC, datetime, time, timedelta
@@ -8,17 +8,17 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from lead_bot.timing import (
-    MAX_CALL_ATTEMPTS,
-    CallingHours,
+    MAX_TEXT_ATTEMPTS,
+    TextingHours,
     clock_label,
-    follow_up_call_time,
     is_allowed,
     next_allowed_time,
+    reminder_time,
 )
 
 PHOENIX = ZoneInfo("America/Phoenix")  # UTC-7 all year: no daylight saving
 DENVER = ZoneInfo("America/Denver")  # has daylight saving
-HOURS = CallingHours(PHOENIX)  # 8:00 to 20:30
+HOURS = TextingHours(PHOENIX)  # 8:00 to 20:30
 
 
 def phoenix(year: int, month: int, day: int, hour: int, minute: int = 0, second: int = 0) -> datetime:
@@ -62,18 +62,18 @@ def test_naive_datetimes_are_refused() -> None:
 )
 def test_settings_outside_the_legal_window_are_refused(earliest: time, latest: time) -> None:
     with pytest.raises(ValueError):
-        CallingHours(PHOENIX, earliest=earliest, latest=latest)
+        TextingHours(PHOENIX, earliest=earliest, latest=latest)
 
 
 def test_a_narrower_window_is_accepted() -> None:
-    narrow = CallingHours(PHOENIX, earliest=time(9, 0), latest=time(18, 0))
+    narrow = TextingHours(PHOENIX, earliest=time(9, 0), latest=time(18, 0))
     assert not is_allowed(phoenix(2026, 10, 5, 8, 30), narrow)
 
 
 # ---- the next opening ----
 
 
-def test_inside_the_window_the_call_is_due_now() -> None:
+def test_inside_the_window_the_text_is_due_now() -> None:
     moment = phoenix(2026, 10, 5, 10, 15)
     assert next_allowed_time(moment, HOURS) == moment
 
@@ -93,46 +93,46 @@ def test_the_next_opening_is_returned_in_utc() -> None:
 
 def test_the_opening_stays_at_eight_across_a_daylight_saving_change() -> None:
     # Denver moved its clocks back on 1 November 2026 at 2 a.m. A form at 10 p.m. on 31 October
-    # (MDT, UTC-6) must be called at 8 a.m. MST (UTC-7) the next day, which is 15:00 UTC. Adding
-    # 10 hours to the UTC time instead would give 7 a.m. local: an illegal call.
-    denver_hours = CallingHours(DENVER)
+    # (MDT, UTC-6) must be texted at 8 a.m. MST (UTC-7) the next day, which is 15:00 UTC. Adding
+    # 10 hours to the UTC time instead would give 7 a.m. local: an illegal text.
+    denver_hours = TextingHours(DENVER)
     result = next_allowed_time(datetime(2026, 10, 31, 22, 0, tzinfo=DENVER), denver_hours)
     assert result.astimezone(DENVER).time() == time(8, 0)
     assert result == datetime(2026, 11, 1, 15, 0, tzinfo=UTC)
 
 
-# ---- follow-ups ----
+# ---- reminders ----
 
 
-def test_follow_ups_are_measured_from_the_first_call() -> None:
-    first_call = phoenix(2026, 10, 5, 10, 0)
-    after_first = follow_up_call_time(first_call, 1, now=phoenix(2026, 10, 5, 10, 1), hours=HOURS)
+def test_reminders_are_measured_from_the_first_text() -> None:
+    first_text = phoenix(2026, 10, 5, 10, 0)
+    after_first = reminder_time(first_text, 1, now=phoenix(2026, 10, 5, 10, 1), hours=HOURS)
     assert after_first == phoenix(2026, 10, 5, 12, 0)  # 2 hours
-    after_second = follow_up_call_time(first_call, 2, now=phoenix(2026, 10, 5, 12, 1), hours=HOURS)
+    after_second = reminder_time(first_text, 2, now=phoenix(2026, 10, 5, 12, 1), hours=HOURS)
     assert after_second == phoenix(2026, 10, 6, 10, 0)  # 1 day
-    after_third = follow_up_call_time(first_call, 3, now=phoenix(2026, 10, 6, 10, 1), hours=HOURS)
+    after_third = reminder_time(first_text, 3, now=phoenix(2026, 10, 6, 10, 1), hours=HOURS)
     assert after_third == phoenix(2026, 10, 8, 10, 0)  # 3 days
 
 
-def test_no_call_after_the_last_attempt() -> None:
-    first_call = phoenix(2026, 10, 5, 10, 0)
+def test_no_reminder_after_the_last_text() -> None:
+    first_text = phoenix(2026, 10, 5, 10, 0)
     now = phoenix(2026, 10, 8, 10, 1)
-    assert follow_up_call_time(first_call, MAX_CALL_ATTEMPTS, now, HOURS) is None
+    assert reminder_time(first_text, MAX_TEXT_ATTEMPTS, now, HOURS) is None
 
 
-def test_a_follow_up_that_lands_at_night_moves_to_the_morning() -> None:
-    # First call at 7:30 p.m.; 2 hours later is 9:30 p.m., outside the window.
-    first_call = phoenix(2026, 10, 5, 19, 30)
-    result = follow_up_call_time(first_call, 1, now=phoenix(2026, 10, 5, 19, 31), hours=HOURS)
+def test_a_reminder_that_lands_at_night_moves_to_the_morning() -> None:
+    # First text at 7:30 p.m.; 2 hours later is 9:30 p.m., outside the window.
+    first_text = phoenix(2026, 10, 5, 19, 30)
+    result = reminder_time(first_text, 1, now=phoenix(2026, 10, 5, 19, 31), hours=HOURS)
     assert result == phoenix(2026, 10, 6, 8, 0)
 
 
-def test_overdue_follow_ups_are_spaced_out_not_fired_together() -> None:
-    # The dialer was down for two days. The 1-day follow-up's planned time has long passed, but
-    # it waits at least an hour after the last call instead of ringing right away.
-    first_call = phoenix(2026, 10, 5, 10, 0)
+def test_overdue_reminders_are_spaced_out_not_sent_together() -> None:
+    # The worker was down for two days. The 1-day reminder's planned time has long passed, but
+    # it waits at least an hour after the last text instead of going out right away.
+    first_text = phoenix(2026, 10, 5, 10, 0)
     now = phoenix(2026, 10, 7, 11, 0)
-    result = follow_up_call_time(first_call, 2, now=now, hours=HOURS)
+    result = reminder_time(first_text, 2, now=now, hours=HOURS)
     assert result == now + timedelta(hours=1)
 
 

@@ -11,10 +11,10 @@ import pytest
 from lead_bot.consent import CONSENT_VERSION, ConsentEvidence, consent_text
 from lead_bot.leads import NewLead
 from lead_bot.store import Store
-from lead_bot.timing import CallingHours
+from lead_bot.timing import TextingHours
 
 PHOENIX = ZoneInfo("America/Phoenix")
-HOURS = CallingHours(PHOENIX)
+HOURS = TextingHours(PHOENIX)
 BUSINESS_NAME = "Desert Ridge Roofing LLC"
 DANA_PHONE = "+16025550142"
 

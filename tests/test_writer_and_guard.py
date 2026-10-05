@@ -9,13 +9,13 @@ from typing import Any
 
 import httpx
 import pytest
-from call_fakes import SETTINGS
 from openai import OpenAI
+from text_fakes import SETTINGS
 from typesafe_sdk import NoulAnswer
 
-from lead_bot.call_script import call_facts, speakable_phone_numbers
-from lead_bot.guard import BLOCK_AT_PROBABILITY, MAX_SPOKEN_CHARACTERS, REPLY_CHECKS, find_reply_problems
+from lead_bot.guard import BLOCK_AT_PROBABILITY, MAX_REPLY_CHARACTERS, REPLY_CHECKS, find_reply_problems
 from lead_bot.jev import Answer
+from lead_bot.text_script import conversation_facts
 from lead_bot.writer import OpenAIWriter, Turn, WriterError
 
 # ---- the writer ----
@@ -61,7 +61,10 @@ def test_the_writer_request_and_its_parsed_answer() -> None:
         request_details["body"] = json.loads(request.content)
         return httpx.Response(200, json=openai_response_body())
 
-    history = [Turn("assistant", "Hello, this call is from..."), Turn("user", "How long does it take?")]
+    history = [
+        Turn("assistant", "Hi Dana, this is the automated assistant..."),
+        Turn("user", "How long does it take?"),
+    ]
     reply = writer_with_fake_http(handler).write(
         facts="Inspections take about 60 minutes.", history=history, reason="off_script_question"
     )
@@ -75,7 +78,7 @@ def test_the_writer_request_and_its_parsed_answer() -> None:
     assert body["reasoning"] == {"effort": "none"}
     assert body["max_output_tokens"] == 300
     assert body["store"] is False
-    # The call's opening is dropped so the window starts on the homeowner's turn.
+    # The first text is dropped so the window starts on the homeowner's turn.
     assert body["input"] == [{"role": "user", "content": "How long does it take?"}]
 
 
@@ -100,14 +103,15 @@ def test_an_http_error_becomes_a_writer_error() -> None:
         writer_with_fake_http(handler).write(facts="", history=[Turn("user", "hi")], reason="x")
 
 
-def test_the_facts_come_from_the_settings_and_the_call() -> None:
-    facts = call_facts(SETTINGS, "12 Saguaro Ln, Mesa AZ", booked_label=None)
+def test_the_facts_come_from_the_settings_and_the_conversation() -> None:
+    facts = conversation_facts(SETTINGS, "12 Saguaro Ln, Mesa AZ", booked_label=None)
     assert "Inspections take about 60 minutes." in facts
     assert "Monday to Friday, between 8 AM and 5 PM, up to 14 days ahead" in facts
     assert "12 Saguaro Ln, Mesa AZ" in facts
     assert "No inspection has been booked yet" in facts
-    booked = call_facts(SETTINGS, "12 Saguaro Ln", booked_label="Tuesday October 6 at 8 AM")
-    assert "An inspection is booked on this call for Tuesday October 6 at 8 AM." in booked
+    assert "artificial intelligence that texts" in facts
+    booked = conversation_facts(SETTINGS, "12 Saguaro Ln", booked_label="Tuesday October 6 at 8 AM")
+    assert "An inspection is booked for Tuesday October 6 at 8 AM." in booked
 
 
 # ---- the guard ----
@@ -115,9 +119,7 @@ def test_the_facts_come_from_the_settings_and_the_call() -> None:
 
 def check_answers(**yes_probabilities: float) -> dict[str, Answer]:
     """Jev's answers to the reply checks: every check 0.0 unless given."""
-    return {
-        name: NoulAnswer(type="noul", noul=yes_probabilities.get(name, 0.0)) for name in REPLY_CHECKS
-    }
+    return {name: NoulAnswer(type="noul", noul=yes_probabilities.get(name, 0.0)) for name in REPLY_CHECKS}
 
 
 CLEAN_DRAFT = "The inspection takes about an hour."
@@ -170,7 +172,7 @@ def test_saying_the_inspection_is_free_is_allowed() -> None:
 
 def test_empty_and_long_drafts_are_blocked() -> None:
     assert find_reply_problems("   ", check_answers()) == ["empty"]
-    long_draft = "word " * (MAX_SPOKEN_CHARACTERS // 5 + 1)
+    long_draft = "word " * (MAX_REPLY_CHARACTERS // 5 + 1)
     assert find_reply_problems(long_draft, check_answers()) == ["too_long"]
 
 
@@ -185,16 +187,3 @@ def test_empty_and_long_drafts_are_blocked() -> None:
 )
 def test_a_follow_up_promised_in_the_writers_own_words_is_blocked(draft: str) -> None:
     assert "promises_follow_up" in find_reply_problems(draft, check_answers())
-
-
-@pytest.mark.parametrize(
-    ("written", "spoken"),
-    [
-        ("Call 480-555-0199.", "Call 4 8 0, 5 5 5, 0 1 9 9."),
-        ("Call (480) 555-0199 today", "Call 4 8 0, 5 5 5, 0 1 9 9 today"),
-        ("+1 480.555.0199", "4 8 0, 5 5 5, 0 1 9 9"),
-        ("It takes about 60 minutes.", "It takes about 60 minutes."),
-    ],
-)
-def test_written_phone_numbers_become_spoken_digits(written: str, spoken: str) -> None:
-    assert speakable_phone_numbers(written) == spoken

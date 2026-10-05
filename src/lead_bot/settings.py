@@ -1,9 +1,9 @@
 # lead-bot/src/lead_bot/settings.py
 """The business's settings, read from the environment (.env locally).
 
-Phase 1 needed only the name and timezone. Phase 2 adds what a call needs: the callback number
-spoken in the opening, the public address Twilio connects back to, and the inspection hours.
-Twilio's own credentials come in phase 4.
+The business name and timezone, the phone number people can call, the public address of the
+server, and the inspection hours. Twilio's own credentials come with the texting phase that
+needs them.
 """
 
 from __future__ import annotations
@@ -13,14 +13,14 @@ from dataclasses import dataclass
 from datetime import time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .leads import InvalidLeadForm, normalize_us_phone, pretty_phone
+from .leads import InvalidLeadForm, normalize_us_phone
 from .slots import BookingRules
-from .timing import CallingHours
+from .timing import TextingHours
 
 DEFAULT_TIMEZONE = "America/Phoenix"
 
 # Where the server can be reached. Locally that's uvicorn's default address. On the VPS it's the
-# public https:// address, and Twilio connects to the wss:// form of it for the live call.
+# public https:// address Twilio delivers incoming texts to.
 DEFAULT_PUBLIC_BASE_URL = "http://127.0.0.1:8000"
 
 
@@ -44,29 +44,17 @@ def placeholder_inspection_rules(timezone: ZoneInfo) -> BookingRules:
 
 @dataclass(frozen=True)
 class BusinessSettings:
-    # The REGISTERED business name. 47 CFR 64.1200(b)(1) requires an artificial-voice call to
-    # begin with "the name under which the entity is registered to conduct business" with the
-    # state, so a nickname or brand here would make every call non-compliant.
+    # The REGISTERED business name. The consent wording authorizes this seller by name, the first
+    # text introduces the bot under it, and toll-free verification checks it against the business
+    # that registered the number. A nickname here would match none of them.
     business_name: str
     timezone: ZoneInfo
-    calling_hours: CallingHours
-    # Said in every call's opening. 47 CFR 64.1200(b)(2) requires a number the homeowner can call
-    # back, and it may not be the number the call comes from. E.164, like +14805550199.
+    texting_hours: TextingHours
+    # A number people can phone: in the last reminder, the HELP reply, and the facts the writer
+    # may give. Not the texting number: a toll-free texting number may not take voice calls.
+    # E.164, like +14805550199.
     callback_phone: str = "+14805550199"
     public_base_url: str = DEFAULT_PUBLIC_BASE_URL
-
-    @property
-    def callback_phone_spoken(self) -> str:
-        """'(480) 555-0199': how the opening says it."""
-        return pretty_phone(self.callback_phone)
-
-    @property
-    def relay_url(self) -> str:
-        """The WebSocket address for live calls: ws:// locally, wss:// behind https."""
-        base = self.public_base_url.rstrip("/")
-        if base.startswith("https://"):
-            return "wss://" + base.removeprefix("https://") + "/calls/relay"
-        return "ws://" + base.removeprefix("http://") + "/calls/relay"
 
     @property
     def inspection_rules(self) -> BookingRules:
@@ -78,7 +66,7 @@ class BusinessSettings:
         if not business_name:
             raise RuntimeError(
                 "BUSINESS_NAME must be set in .env: the business's registered name. It appears in "
-                "the consent text on the form and is said first on every call."
+                "the consent text on the form and in the first text to every lead."
             )
         timezone_name = os.environ.get("BUSINESS_TIMEZONE", DEFAULT_TIMEZONE)
         try:
@@ -92,9 +80,8 @@ class BusinessSettings:
             callback_phone = normalize_us_phone(raw_callback_phone)
         except InvalidLeadForm:
             raise RuntimeError(
-                "BUSINESS_CALLBACK_PHONE must be set in .env to a 10-digit US number people can call "
-                "back on. The rules require it in every call's opening, and it can't be the number "
-                "the calls come from."
+                "BUSINESS_CALLBACK_PHONE must be set in .env to a 10-digit US number people can "
+                "phone. The last reminder and the HELP reply give it, and the writer may too."
             ) from None
         public_base_url = os.environ.get("PUBLIC_BASE_URL", DEFAULT_PUBLIC_BASE_URL).strip()
         if not public_base_url.startswith(("http://", "https://")):
@@ -102,17 +89,17 @@ class BusinessSettings:
         return cls(
             business_name=business_name,
             timezone=timezone,
-            calling_hours=CallingHours(timezone),
+            texting_hours=TextingHours(timezone),
             callback_phone=callback_phone,
             public_base_url=public_base_url,
         )
 
 
 def database_path_from_environment() -> str:
-    """Where the SQLite file lives. The form server and the dialer both call this.
+    """Where the SQLite file lives. The form server and the worker both call this.
 
-    They must open the same file: the server writes leads and the dialer reads them. If each
-    worked the path out separately, a change to one would leave the dialer polling an empty
-    database forever, with no error.
+    They must open the same file: the server writes leads and incoming texts, and the worker
+    reads them. If each worked the path out separately, a change to one would leave the worker
+    polling an empty database forever, with no error.
     """
     return os.environ.get("LEAD_BOT_DB_PATH", "lead_bot.db")

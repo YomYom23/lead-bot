@@ -1,7 +1,8 @@
 # lead-bot/src/lead_bot/wiring.py
-"""Builds the real services a live call uses: Jev, and the Google Calendar booking.
+"""Builds the real services a conversation uses: Jev, the Google Calendar booking, and the writer.
 
-Kept apart from main.py so the dialer's simulator mode and the server build them the same way.
+Kept apart from worker.py so the worker, the simulator and the scenario runner build them the
+same way.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import threading
 from pathlib import Path
 
 from .booking import CalendarBooking
-from .call_session import CallServices
+from .conversation import ConversationServices
 from .google_calendar import (
     GoogleAuthExpired,
     GoogleCalendarClient,
@@ -23,32 +24,33 @@ from .settings import BusinessSettings
 from .slots import BookingRules
 from .writer import OpenAIWriter
 
-# On a call, every second of waiting is silence the homeowner hears. One retry, then the call
-# hands off to a person ("someone will call you back") rather than leaving them on hold.
-JEV_TIMEOUT_SECONDS = 2.5
-JEV_RETRIES = 1
-CALENDAR_TIMEOUT_SECONDS = 5.0
-# The writer runs after "Let me check.", so it gets a little longer than Jev, but no retry: a
-# failed draft falls back to the fixed "our team will answer that" line straight away.
-WRITER_TIMEOUT_SECONDS = 4.0
+# A text reply can take a few seconds without anyone noticing, unlike a pause on a phone call, so
+# these are far looser than the voice version's. If Jev still fails, the worker tries the same
+# text again a little later (worker.RETRY_DELAY) before handing it to a person.
+JEV_TIMEOUT_SECONDS = 10.0
+JEV_RETRIES = 2
+CALENDAR_TIMEOUT_SECONDS = 10.0
+# No retry for the writer: a failed draft falls back to the fixed "I'll pass that question to our
+# team" text, so a retry would only delay an answer that's already safe.
+WRITER_TIMEOUT_SECONDS = 15.0
 # WRITER_MODEL in .env overrides this, so trying another model needs no code change.
 DEFAULT_WRITER_MODEL = "gpt-6-luna"
 
 
 class GoogleBookingLoader:
-    """Hands out the calendar booking, reading the Google sign-in the first time a call needs it.
+    """Hands out the calendar booking, reading the Google sign-in the first time a text needs it.
 
-    Reading it lazily means a missing or expired sign-in fails only the booking step of a call
-    (which hands off to a person), not the whole server at startup. And because the file is
-    re-read whenever it changes, running google_login again fixes an expired sign-in without
-    restarting anything.
+    Reading it lazily means a missing or expired sign-in fails only the booking step of one
+    conversation (which hands off to a person), not the whole worker at startup. And because the
+    file is re-read whenever it changes, running google_login again fixes an expired sign-in
+    without restarting anything.
     """
 
     def __init__(self, rules: BookingRules, token_path: Path, calendar_id: str) -> None:
         self._rules = rules
         self._token_path = token_path
         self._calendar_id = calendar_id
-        self._lock = threading.Lock()  # two calls reaching the booking step at once load it once
+        self._lock = threading.Lock()  # two conversations reaching the booking step at once load it once
         self._booking: CalendarBooking | None = None
         self._loaded_file_version: int | None = None
 
@@ -70,23 +72,34 @@ class GoogleBookingLoader:
             return self._booking
 
 
-def build_call_services(settings: BusinessSettings) -> CallServices:
+def build_jev() -> Jev:
+    return Jev(timeout_seconds=JEV_TIMEOUT_SECONDS, max_retries=JEV_RETRIES)
+
+
+def build_writer() -> OpenAIWriter:
+    return OpenAIWriter(
+        model=os.environ.get("WRITER_MODEL", "").strip() or DEFAULT_WRITER_MODEL,
+        timeout_seconds=WRITER_TIMEOUT_SECONDS,
+    )
+
+
+def require_model_keys() -> None:
+    """Stop with a clear message, naming what's missing, before anything is sent."""
     missing = [
         name for name in ("TYPESAFE_API_KEY", "OPENAI_API_KEY") if not os.environ.get(name, "").strip()
     ]
     if missing:
         raise RuntimeError(
-            f"{' and '.join(missing)} must be set in .env. TYPESAFE_API_KEY: Jev reads what the "
-            "homeowner says on every call. OPENAI_API_KEY: the writer answers off-script questions."
+            f"{' and '.join(missing)} must be set in .env. TYPESAFE_API_KEY: Jev reads every text "
+            "the homeowner sends. OPENAI_API_KEY: the writer answers off-script questions."
         )
-    jev = Jev(timeout_seconds=JEV_TIMEOUT_SECONDS, max_retries=JEV_RETRIES)
+
+
+def build_conversation_services(settings: BusinessSettings) -> ConversationServices:
+    require_model_keys()
     booking = GoogleBookingLoader(
         settings.inspection_rules,
         google_token_path_from_environment(),
         calendar_id=os.environ.get("GOOGLE_CALENDAR_ID", "").strip() or "primary",
     )
-    writer = OpenAIWriter(
-        model=os.environ.get("WRITER_MODEL", "").strip() or DEFAULT_WRITER_MODEL,
-        timeout_seconds=WRITER_TIMEOUT_SECONDS,
-    )
-    return CallServices(ask_jev=jev.ask, booking=booking, writer=writer)
+    return ConversationServices(ask_jev=build_jev().ask, booking=booking, writer=build_writer())

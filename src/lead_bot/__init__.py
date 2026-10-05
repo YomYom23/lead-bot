@@ -1,7 +1,8 @@
 # lead-bot/src/lead_bot/__init__.py
-"""lead-bot: answers a roofing company's web leads with an AI-voice phone call.
+"""lead-bot: answers a roofing company's web leads by text message and books a free inspection.
 
-A homeowner fills in the inspection form (server.py). If they agreed to calls, the dialer
-(dialer.py) phones them within a minute, inside legal calling hours (timing.py), and keeps a
-proof record of the consent it relied on (consent.py, store.py).
+A homeowner fills in the inspection form (server.py). If they agreed to texts, the worker
+(worker.py) texts them within a minute, inside legal texting hours (timing.py), and keeps a proof
+record of the consent it relied on (consent.py, store.py). Each reply is handled by the
+conversation logic (conversation.py), which books the inspection on Google Calendar.
 """

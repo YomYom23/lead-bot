@@ -2,14 +2,14 @@
 """The web server: the roofing company's inspection-request form, and a health check.
 
   GET  /        -> the form
-  POST /leads   -> validate, record the lead and its consent evidence, schedule the first call
-  GET  /health  -> counts of leads and calls by status
+  POST /leads   -> validate, record the lead and its consent evidence, schedule the first text
+  GET  /health  -> counts of leads and texts by status
 
-POST /leads only records and schedules; it never dials. Dialing happens in the dialer process
-(dialer.py), which re-checks consent, the do-not-call list and calling hours right before it
-places each call.
+POST /leads only records and schedules; it never sends. Sending happens in the worker process
+(worker.py), which re-checks consent, the do-not-call list and texting hours right before it
+queues each text the bot starts.
 
-Later phases add the endpoints Twilio calls during a call.
+The texting phase adds the endpoint Twilio delivers incoming texts to.
 """
 
 from __future__ import annotations
@@ -24,10 +24,8 @@ from typing import Annotated
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse
 
-from .call_session import CallServices
 from .consent import CONSENT_VERSION, ConsentEvidence, consent_text
 from .leads import PROBLEM_LABELS, InvalidLeadForm, parse_lead_form, pretty_phone
-from .relay import add_relay_route
 from .settings import BusinessSettings
 from .store import AddedLead, Store
 from .timing import clock_label, utc_now
@@ -83,9 +81,9 @@ $problem_options
     <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
   </div>
   <!-- Unticked by default and not required: consent must be a free choice, and the form works
-       without it (the owner then calls personally instead of the AI). -->
+       without it (the owner then contacts them personally instead of the bot). -->
   <label class="consent">
-    <input type="checkbox" name="call_consent" value="yes"$consent_checked>
+    <input type="checkbox" name="text_consent" value="yes"$consent_checked>
     <span>$consent_text</span>
   </label>
   <input type="hidden" name="consent_version" value="$consent_version">
@@ -97,13 +95,8 @@ def create_app(
     store: Store,
     settings: BusinessSettings,
     clock: Callable[[], datetime] = utc_now,
-    call_services: CallServices | None = None,
 ) -> FastAPI:
-    """Build the app. Store, settings and clock are passed in so tests can control them.
-
-    Without call_services there's no live-call endpoint: the form works on its own, which is all
-    the form tests need.
-    """
+    """Build the app. Store, settings and clock are passed in so tests can control them."""
     app = FastAPI(title="lead-bot")
 
     def page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
@@ -152,23 +145,21 @@ def create_app(
         address: Annotated[str, Form()] = "",
         problem: Annotated[str, Form()] = "",
         # A browser sends an unticked checkbox as nothing at all, hence None.
-        call_consent: Annotated[str | None, Form()] = None,
+        text_consent: Annotated[str | None, Form()] = None,
         consent_version: Annotated[str, Form()] = "",
         website: Annotated[str, Form()] = "",
     ) -> HTMLResponse:
         if website:
             # The bot trap was filled in. Show the normal thank-you page so the bot learns
-            # nothing, but store nothing and call no one.
+            # nothing, but store nothing and text no one.
             logger.info("form submission dropped: bot trap filled")
             return page("Thank you", _thanks_body(None, settings, phone_shown="", now=clock()))
 
-        consent_ticked = call_consent == "yes"
+        consent_ticked = text_consent == "yes"
         try:
             new_lead = parse_lead_form(full_name, phone, address, problem)
         except InvalidLeadForm as error:
-            return form_page(
-                str(error), full_name, phone, address, problem, consent_ticked, status_code=400
-            )
+            return form_page(str(error), full_name, phone, address, problem, consent_ticked, status_code=400)
 
         # The tick only counts if it was given against the wording this server shows now. A
         # page opened before the wording changed showed different text, and the record must
@@ -186,7 +177,7 @@ def create_app(
             source=str(request.url),
         )
         submitted_at = clock()
-        added = store.add_lead(new_lead, evidence, submitted_at, settings.calling_hours)
+        added = store.add_lead(new_lead, evidence, submitted_at, settings.texting_hours)
         logger.info("lead %d added: %s", added.lead_id, added.decision)
         return page(
             "Thank you",
@@ -202,42 +193,35 @@ def create_app(
         # Browsers ask for this on every page. A plain 204 keeps it out of the error log.
         return Response(status_code=204)
 
-    if call_services is not None:
-        add_relay_route(app, store, settings, call_services, clock)
     return app
 
 
-def _thanks_body(
-    added: AddedLead | None, settings: BusinessSettings, phone_shown: str, now: datetime
-) -> str:
-    """The thank-you page. It only promises the call that will really happen.
+def _thanks_body(added: AddedLead | None, settings: BusinessSettings, phone_shown: str, now: datetime) -> str:
+    """The thank-you page. It only promises the text that will really be sent.
 
-    A lead without an AI call (no consent, or a number that opted out before) gets the same
+    A lead the bot won't text (no consent, or a number that opted out before) gets the same
     neutral wording as a dropped bot submission. The page never says why, so it can't reveal
     who is on the do-not-call list.
     """
     business = html.escape(settings.business_name)
-    if added is None or added.first_call_due is None:
+    if added is None or added.first_text_due is None:
         if added is not None and added.decision == "already_in_follow_up":
             return (
                 "<h1>Thank you!</h1><p>We already have your request and will be in touch at "
                 f"{html.escape(phone_shown)}. There's no need to send it again.</p>"
             )
         return f"<h1>Thank you!</h1><p>Someone from {business} will be in touch soon.</p>"
-    # Inside calling hours the first call is due the moment the form arrives. Outside them it's
+    # Inside texting hours the first text is due the moment the form arrives. Outside them it's
     # due at the next opening, and the page says when.
-    if added.first_call_due <= now:
+    if added.first_text_due <= now:
         when = "in the next minute or so"
     else:
-        due_day = added.first_call_due.astimezone(settings.timezone).date()
+        due_day = added.first_text_due.astimezone(settings.timezone).date()
         today = now.astimezone(settings.timezone).date()
         day_word = "today" if due_day == today else "tomorrow"  # never later: hours open daily
-        when = (
-            f"{day_word} at {clock_label(added.first_call_due, settings.timezone)} "
-            "(the earliest time we're allowed to call)"
-        )
+        when = f"{day_word} at {clock_label(added.first_text_due, settings.timezone)}"
     return (
-        f"<h1>Thank you!</h1><p>{business}'s automated assistant will call you at "
+        f"<h1>Thank you!</h1><p>{business}'s automated assistant will text you at "
         f"{html.escape(phone_shown)} {when} to set up your inspection. "
-        "Press 9 or say \"stop\" on the call at any time if you'd rather not be called.</p>"
+        "Reply STOP at any time to stop the texts.</p>"
     )

@@ -1,18 +1,23 @@
 # lead-bot/src/lead_bot/timing.py
-"""When the bot may call: the calling window and the follow-up schedule.
+"""When the bot may start a text: the texting window and the reminder schedule.
 
-The federal rules (47 CFR 64.1200(c)(1)) ban telemarketing calls before 8 a.m. or after 9 p.m.
-in the called person's local time. Every call this bot makes is treated as telemarketing (the
-cautious reading), so every call time passes through next_allowed_time when it's scheduled, and
-the dialer checks is_allowed again right before it dials.
+The FCC treats a text message as a "call" under the federal robocall law, so the quiet-hours rule
+for telemarketing (47 CFR 64.1200(c)(1): nothing before 8 a.m. or after 9 p.m. in the recipient's
+local time) is applied to every text the bot STARTS: the first text and each reminder. Every one
+passes through next_allowed_time when it's scheduled, and the worker checks is_allowed again right
+before it sends one.
 
-Version 1 uses the business's timezone for the lead's local time: a roofer serves one area, so
-its leads live in its timezone. A lead in another timezone would need their own (from the
-address) before this is safe for a business near a timezone line.
+A reply to a text the homeowner just sent is not held for the window: they wrote first and are
+waiting for the answer. That reading goes on the list for the lawyer, as do state rules that are
+stricter than the federal one.
 
-Every datetime here is timezone-aware. Naive datetimes are refused, because Python's
-astimezone() treats a naive datetime as the computer's own local time, which is silently wrong
-on a server in another timezone.
+Version 1 uses the business's timezone for the lead's local time: a roofer serves one area, so its
+leads live in its timezone. A lead in another timezone would need their own (from the address)
+before this is safe for a business near a timezone line.
+
+Every datetime here is timezone-aware. Naive datetimes are refused, because Python's astimezone()
+treats a naive datetime as the computer's own local time, which is silently wrong on a server in
+another timezone.
 """
 
 from __future__ import annotations
@@ -23,40 +28,40 @@ from zoneinfo import ZoneInfo
 
 # The federal limits. 8:00 itself is allowed (the rule bans calls "before the hour of 8 a.m."),
 # and 21:00 is not.
-LEGAL_EARLIEST_CALL = time(8, 0)
-LEGAL_LATEST_CALL = time(21, 0)
+LEGAL_EARLIEST_TEXT = time(8, 0)
+LEGAL_LATEST_TEXT = time(21, 0)
 
-# The default last start time is 30 minutes inside the legal limit. A call due at 8:59 p.m. can
-# start at 9:00:05 after a slow poll or a retry, and lawsuits over messages that arrived a few
-# minutes late are common. The margin absorbs that.
-DEFAULT_LATEST_CALL = time(20, 30)
+# The default last start time is 30 minutes inside the legal limit. A text due at 8:59 p.m. can
+# go out at 9:00:05 after a slow worker pass or a retry, and lawsuits over messages that arrived a
+# few minutes late are common. The margin absorbs that.
+DEFAULT_LATEST_TEXT = time(20, 30)
 
-# Placeholder follow-up schedule. After the first call goes unanswered, call again 2 hours,
-# 1 day and 3 days after the first call, then stop. Each delay is measured from the first
-# call, so a late retry doesn't push every later one back.
-FOLLOW_UP_DELAYS = (timedelta(hours=2), timedelta(days=1), timedelta(days=3))
-MAX_CALL_ATTEMPTS = 1 + len(FOLLOW_UP_DELAYS)
+# Placeholder reminder schedule. If the homeowner hasn't replied, remind them 2 hours, 1 day and
+# 3 days after the first text, then stop. Each delay is measured from the first text, so a late
+# reminder doesn't push every later one back.
+REMINDER_DELAYS = (timedelta(hours=2), timedelta(days=1), timedelta(days=3))
+MAX_TEXT_ATTEMPTS = 1 + len(REMINDER_DELAYS)
 
-# Two calls are never closer together than this. If the dialer was down and planned follow-up
-# times have passed, they'd otherwise all come due at once and ring the homeowner back to back.
-MINIMUM_GAP_BETWEEN_CALLS = timedelta(hours=1)
+# Two opening texts are never closer together than this. If the worker was down and planned
+# reminder times have passed, they'd otherwise all come due at once and arrive back to back.
+MINIMUM_GAP_BETWEEN_TEXTS = timedelta(hours=1)
 
 
 @dataclass(frozen=True)
-class CallingHours:
+class TextingHours:
     timezone: ZoneInfo
-    earliest: time = LEGAL_EARLIEST_CALL  # the first moment a call may start
-    latest: time = DEFAULT_LATEST_CALL  # calls must start BEFORE this; it is not included
+    earliest: time = LEGAL_EARLIEST_TEXT  # the first moment a text may be started
+    latest: time = DEFAULT_LATEST_TEXT  # texts must start BEFORE this; it is not included
 
     def __post_init__(self) -> None:
-        # A narrower window than the law allows is fine (a business may not want 8 a.m. calls).
-        # A wider one is refused here, so no setting can ever produce an illegal call time.
-        if self.earliest < LEGAL_EARLIEST_CALL or self.latest > LEGAL_LATEST_CALL:
+        # A narrower window than the law allows is fine (a business may not want 8 a.m. texts).
+        # A wider one is refused here, so no setting can ever produce an illegal send time.
+        if self.earliest < LEGAL_EARLIEST_TEXT or self.latest > LEGAL_LATEST_TEXT:
             raise ValueError(
-                f"calling hours {self.earliest}-{self.latest} go outside the legal 8:00-21:00 window"
+                f"texting hours {self.earliest}-{self.latest} go outside the legal 8:00-21:00 window"
             )
         if self.earliest >= self.latest:
-            raise ValueError(f"calling hours start ({self.earliest}) must be before the end ({self.latest})")
+            raise ValueError(f"texting hours start ({self.earliest}) must be before the end ({self.latest})")
 
 
 def utc_now() -> datetime:
@@ -64,15 +69,15 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def is_allowed(moment: datetime, hours: CallingHours) -> bool:
-    """True if a call may start at this moment."""
+def is_allowed(moment: datetime, hours: TextingHours) -> bool:
+    """True if the bot may start a text at this moment."""
     _require_timezone(moment)
     local_time = moment.astimezone(hours.timezone).time()
     return hours.earliest <= local_time < hours.latest
 
 
-def next_allowed_time(moment: datetime, hours: CallingHours) -> datetime:
-    """The moment itself if a call may start then, otherwise the next opening of the window.
+def next_allowed_time(moment: datetime, hours: TextingHours) -> datetime:
+    """The moment itself if a text may start then, otherwise the next opening of the window.
 
     Always returned in UTC, which is how the store saves times.
     """
@@ -91,16 +96,16 @@ def next_allowed_time(moment: datetime, hours: CallingHours) -> datetime:
     return opening_tomorrow.astimezone(UTC)
 
 
-def follow_up_call_time(
-    first_call_started: datetime, completed_attempts: int, now: datetime, hours: CallingHours
+def reminder_time(
+    first_text_sent: datetime, texts_sent: int, now: datetime, hours: TextingHours
 ) -> datetime | None:
-    """When to call again after `completed_attempts` calls went unanswered, or None to stop."""
-    if completed_attempts < 1:
-        raise ValueError("a follow-up only exists after at least one call")
-    if completed_attempts >= MAX_CALL_ATTEMPTS:
+    """When to send the next reminder after `texts_sent` opening texts got no reply, or None to stop."""
+    if texts_sent < 1:
+        raise ValueError("a reminder only exists after at least one text")
+    if texts_sent >= MAX_TEXT_ATTEMPTS:
         return None
-    planned = first_call_started + FOLLOW_UP_DELAYS[completed_attempts - 1]
-    earliest_permitted = now + MINIMUM_GAP_BETWEEN_CALLS
+    planned = first_text_sent + REMINDER_DELAYS[texts_sent - 1]
+    earliest_permitted = now + MINIMUM_GAP_BETWEEN_TEXTS
     return next_allowed_time(max(planned, earliest_permitted), hours)
 
 
