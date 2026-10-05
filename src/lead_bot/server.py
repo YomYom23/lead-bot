@@ -1,15 +1,17 @@
 # lead-bot/src/lead_bot/server.py
-"""The web server: the roofing company's inspection-request form, and a health check.
+"""The web server: the roofing company's inspection-request form, Twilio's two webhooks, and a
+health check.
 
-  GET  /        -> the form
-  POST /leads   -> validate, record the lead and its consent evidence, schedule the first text
-  GET  /health  -> counts of leads and texts by status
+  GET  /                -> the form
+  POST /leads           -> validate, record the lead and its consent evidence, schedule the first text
+  POST /twilio/incoming -> a homeowner's text, from Twilio: check the signature, save it
+  POST /twilio/status   -> Twilio's delivery report for one of our texts: check, save
+  GET  /health          -> counts of leads and texts by status
 
-POST /leads only records and schedules; it never sends. Sending happens in the worker process
-(worker.py), which re-checks consent, the do-not-call list and texting hours right before it
-queues each text the bot starts.
-
-The texting phase adds the endpoint Twilio delivers incoming texts to.
+Nothing here sends a text or calls a model. The handlers record and return at once, because
+Twilio retries a webhook that's slow to answer. Sending and answering happen in the worker
+process (worker.py), which re-checks consent, the do-not-call list and texting hours right
+before it queues each text the bot starts.
 """
 
 from __future__ import annotations
@@ -23,14 +25,20 @@ from typing import Annotated
 
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import FormData
 
 from .consent import CONSENT_VERSION, ConsentEvidence, consent_text
 from .leads import PROBLEM_LABELS, InvalidLeadForm, parse_lead_form, pretty_phone
 from .settings import BusinessSettings
 from .store import AddedLead, Store
 from .timing import clock_label, utc_now
+from .twilio_sms import INCOMING_PATH, STATUS_PATH, TwilioSettings, request_is_from_twilio
 
 logger = logging.getLogger(__name__)
+
+# An empty TwiML reply: "received, send nothing back". The worker sends the answer later.
+EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
 
 # string.Template rather than str.format: the CSS is full of { } braces, which str.format would
 # try to fill in. Template only substitutes $names. Every value put into a page goes through
@@ -95,8 +103,13 @@ def create_app(
     store: Store,
     settings: BusinessSettings,
     clock: Callable[[], datetime] = utc_now,
+    twilio: TwilioSettings | None = None,
 ) -> FastAPI:
-    """Build the app. Store, settings and clock are passed in so tests can control them."""
+    """Build the app. Everything is passed in so tests can control it.
+
+    Without Twilio settings the webhooks answer 503, so a misconfigured server is obvious in
+    Twilio's error log instead of silently dropping texts.
+    """
     app = FastAPI(title="lead-bot")
 
     def page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
@@ -188,12 +201,68 @@ def create_app(
     def health() -> dict[str, object]:
         return {"ok": True, **store.counts()}
 
+    async def checked_twilio_form(request: Request, path: str) -> FormData | Response:
+        """The posted form if the request really came from Twilio, otherwise the error to return."""
+        if twilio is None:
+            logger.error("Twilio webhook called but TWILIO_* isn't set in .env")
+            return Response("Twilio isn't configured on this server", status_code=503)
+        form = await request.form()
+        # Twilio signs the URL it called. Behind Funnel or a proxy this server sees a different
+        # one (http://127.0.0.1:8000/...), so the public address comes from settings.
+        signed_url = settings.public_base_url.rstrip("/") + path
+        if request.url.query:
+            signed_url += "?" + request.url.query
+        signature = request.headers.get("x-twilio-signature")
+        if not request_is_from_twilio(twilio.auth_token, signed_url, form, signature):
+            logger.warning("Twilio webhook %s refused: bad signature (signed URL %s)", path, signed_url)
+            return Response("bad signature", status_code=403)
+        if form.get("AccountSid") != twilio.account_sid:
+            # Signed with our token but for another account: a copied webhook URL. Ignore it.
+            logger.warning("Twilio webhook %s from another account ignored", path)
+            return twiml_response()
+        return form
+
+    @app.post(INCOMING_PATH)
+    async def incoming_text(request: Request) -> Response:
+        checked = await checked_twilio_form(request, INCOMING_PATH)
+        if isinstance(checked, Response):
+            return checked
+        message_id = str(checked.get("MessageSid") or "")
+        phone = str(checked.get("From") or "")
+        body = str(checked.get("Body") or "")
+        if not message_id or not phone:
+            # Nothing to save and nothing Twilio can fix by retrying, so 200.
+            logger.warning("incoming text without MessageSid or From ignored")
+            return twiml_response()
+        # The sqlite write runs off the event loop, so a slow disk can't hold up other requests.
+        saved = await run_in_threadpool(store.record_incoming_text, phone, body, message_id, clock())
+        logger.info("incoming text %s %s", message_id, "saved" if saved is not None else "already saved")
+        return twiml_response()
+
+    @app.post(STATUS_PATH)
+    async def delivery_report(request: Request) -> Response:
+        checked = await checked_twilio_form(request, STATUS_PATH)
+        if isinstance(checked, Response):
+            return checked
+        message_id = str(checked.get("MessageSid") or "")
+        status = str(checked.get("MessageStatus") or "")
+        error_code = str(checked.get("ErrorCode") or "") or None
+        if message_id and status:
+            await run_in_threadpool(store.record_delivery_report, message_id, status, error_code, clock())
+            if error_code is not None:
+                logger.warning("text %s: %s, Twilio error %s", message_id, status, error_code)
+        return twiml_response()
+
     @app.get("/favicon.ico")
     def no_favicon() -> Response:
         # Browsers ask for this on every page. A plain 204 keeps it out of the error log.
         return Response(status_code=204)
 
     return app
+
+
+def twiml_response() -> Response:
+    return Response(EMPTY_TWIML, media_type="text/xml")
 
 
 def _thanks_body(added: AddedLead | None, settings: BusinessSettings, phone_shown: str, now: datetime) -> str:

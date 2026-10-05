@@ -123,6 +123,17 @@ CREATE TABLE IF NOT EXISTS do_not_call (
     source   TEXT NOT NULL                  -- e.g. 'replied STOP', 'owner'
 );
 
+-- Twilio's delivery reports (the status callback), one row per text, keeping the latest.
+-- Kept apart from texts because a report can arrive before the worker has recorded the send
+-- (it only learns Twilio's MessageSid when the send returns). mark_text_sent applies any report
+-- already waiting for that MessageSid.
+CREATE TABLE IF NOT EXISTS delivery_reports (
+    provider_message_id TEXT PRIMARY KEY,
+    status              TEXT NOT NULL,          -- Twilio's MessageStatus, e.g. 'delivered'
+    error_code          TEXT,                   -- Twilio's ErrorCode, e.g. '30032'
+    received_at         REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS owner_alerts (
     alert_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     lead_id    INTEGER REFERENCES leads (lead_id),  -- NULL: about a number with no lead
@@ -142,9 +153,17 @@ TextKind = Literal["homeowner", "opening", "reply", "stop_confirmation"]
 IncomingStatus = Literal["received", "handling", "handled"]
 
 # Outgoing: queued -> waiting to be sent;  sending -> handed to the sender;  sent -> accepted by
-#           the provider;  failed -> refused;  cancelled -> never sent (the number opted out);
-#           unknown -> a worker stopped mid-send, so it may or may not have gone
-OutgoingStatus = Literal["queued", "sending", "sent", "failed", "cancelled", "unknown"]
+#           the provider;  delivered -> the carrier confirmed delivery;  undelivered -> the
+#           carrier reported it wasn't delivered;  failed -> refused, or the provider couldn't
+#           send it;  cancelled -> never sent (the number opted out);  unknown -> a worker
+#           stopped mid-send, so it may or may not have gone
+OutgoingStatus = Literal[
+    "queued", "sending", "sent", "delivered", "undelivered", "failed", "cancelled", "unknown"
+]
+
+# Twilio statuses that end a text's story. Only these change a text's row; the in-between ones
+# ('queued', 'sending', 'sent') say nothing the row doesn't already.
+FINAL_DELIVERY_STATUSES = ("delivered", "undelivered", "failed")
 
 # What queue_opening_text did:
 #   queued      -> the text is queued to send now
@@ -718,6 +737,37 @@ class Store:
                 "WHERE text_id = ? AND status = 'sending'",
                 (provider_message_id, now.timestamp(), text_id),
             )
+            # Twilio may have reported on it already, between taking it and our recording it.
+            _apply_delivery_report(connection, provider_message_id, now)
+
+    def return_text_to_queue(self, text_id: int) -> None:
+        """Undo a claim: the send never reached the provider (our credentials were refused).
+        The try isn't counted, since the text itself was never the problem."""
+        with self._write_transaction() as connection:
+            connection.execute(
+                "UPDATE texts SET status = 'queued', tries = MAX(tries - 1, 0) "
+                "WHERE text_id = ? AND status = 'sending'",
+                (text_id,),
+            )
+
+    def record_delivery_report(
+        self, provider_message_id: str, status: str, error_code: str | None, now: datetime
+    ) -> None:
+        """Save one of Twilio's delivery reports and apply it to the text it's about.
+
+        Reports can arrive out of order and more than once, so a final status ('delivered',
+        'undelivered', 'failed') is never replaced by a later in-between one.
+        """
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO delivery_reports (provider_message_id, status, error_code, received_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (provider_message_id) DO UPDATE SET "
+                "status = excluded.status, error_code = excluded.error_code, "
+                "received_at = excluded.received_at "
+                "WHERE delivery_reports.status NOT IN ('delivered', 'undelivered', 'failed')",
+                (provider_message_id, status, error_code, now.timestamp()),
+            )
+            _apply_delivery_report(connection, provider_message_id, now)
 
     def mark_text_failed(self, text_id: int, error: str, now: datetime) -> None:
         """The provider refused the text. The owner is alerted, because the homeowner is now
@@ -871,6 +921,32 @@ def _is_on_do_not_call(connection: sqlite3.Connection, phone: str) -> bool:
     return connection.execute("SELECT 1 FROM do_not_call WHERE phone = ?", (phone,)).fetchone() is not None
 
 
+def _apply_delivery_report(connection: sqlite3.Connection, provider_message_id: str, now: datetime) -> None:
+    """Move a sent text to its final delivery status, if a final report for it has arrived.
+
+    Only a text still 'sent' changes, so a repeated report does nothing the second time. A text
+    that didn't arrive alerts the owner: the homeowner is waiting on an answer they never got.
+    """
+    report = connection.execute(
+        "SELECT status, error_code FROM delivery_reports WHERE provider_message_id = ?",
+        (provider_message_id,),
+    ).fetchone()
+    if report is None or report["status"] not in FINAL_DELIVERY_STATUSES:
+        return
+    error_note = None if report["error_code"] is None else f"Twilio error {report['error_code']}"
+    cursor = connection.execute(
+        "UPDATE texts SET status = ?, note = COALESCE(?, note) "
+        "WHERE provider_message_id = ? AND direction = 'out' AND status = 'sent'",
+        (report["status"], error_note, provider_message_id),
+    )
+    if cursor.rowcount == 1 and report["status"] != "delivered":
+        text = connection.execute(
+            "SELECT lead_id FROM texts WHERE provider_message_id = ?", (provider_message_id,)
+        ).fetchone()
+        reason = f"text_not_delivered:{report['error_code'] or 'no_error_code'}"
+        _add_owner_alert(connection, text["lead_id"], reason, now)
+
+
 def _add_owner_alert(connection: sqlite3.Connection, lead_id: int | None, reason: str, now: datetime) -> None:
     connection.execute(
         "INSERT INTO owner_alerts (lead_id, reason, created_at) VALUES (?, ?, ?)",
@@ -980,10 +1056,11 @@ def _load_conversation(connection: sqlite3.Connection, lead_id: int) -> tuple[Co
 
 
 def _history(connection: sqlite3.Connection, lead_id: int, before_text_id: int) -> list[Turn]:
-    """The conversation before one text, as the writer sees it. Texts never sent are left out."""
+    """The conversation before one text, as the writer sees it. Texts the homeowner never got
+    (cancelled, refused, or reported undelivered) are left out."""
     rows = connection.execute(
         "SELECT direction, body FROM texts WHERE lead_id = ? AND text_id < ? "
-        "AND status NOT IN ('cancelled', 'failed') ORDER BY text_id",
+        "AND status NOT IN ('cancelled', 'failed', 'undelivered') ORDER BY text_id",
         (lead_id, before_text_id),
     ).fetchall()
     return [Turn("user" if row["direction"] == "in" else "assistant", row["body"]) for row in rows]

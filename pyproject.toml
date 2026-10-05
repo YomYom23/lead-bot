@@ -12,7 +12,9 @@ dependencies = [
   "httpx2>=2.0.0,<3",
   "openai>=2.54,<3",
   "python-dotenv>=1.2.4",
-  # Jev: reads each thing the homeowner says on a call.
+  # Sending texts, and checking that a webhook really came from Twilio (twilio_sms.py).
+  "twilio>=9,<10",
+  # Jev: reads each text the homeowner sends.
   "typesafe-sdk>=0.7.1,<0.8",
   # Python's zoneinfo needs a timezone database, and Windows doesn't ship one. Calling hours
   # depend on it, so a missing database must be an install error, not a runtime surprise.
@@ -48,6 +50,11 @@ mypy_path = "src"
 # imports it, and only to run the browser sign-in.
 [[tool.mypy.overrides]]
 module = ["google_auth_oauthlib", "google_auth_oauthlib.*"]
+ignore_missing_imports = true
+
+# Twilio's SDK has no type information either. Only twilio_sms.py imports it.
+[[tool.mypy.overrides]]
+module = ["twilio", "twilio.*"]
 ignore_missing_imports = true
 
 [tool.ruff]

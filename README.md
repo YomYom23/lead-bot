@@ -12,20 +12,23 @@ The voice-call version (phases 1-3) is kept at the git tag `voice-final`.
 | Phase | What | Status |
 | --- | --- | --- |
 | 1 | Texting without Twilio: conversation, reminders, opt-out, simulator, ~50 scenarios | done (dry run) |
-| 2 | Twilio: incoming-text webhook, sending, delivery status, Virtual Phone test | next |
+| 2 | Twilio: incoming-text webhook, sending, delivery status, Virtual Phone test | built; Virtual Phone test next |
 | 3 | Real phones, after toll-free verification is approved | |
 
-Nothing is texted to anyone yet: the worker prints each text instead of sending it.
+The worker prints each text unless it's started with `--send`.
 
 ## How it works
 
 Two processes share one SQLite file:
 
 - **The server** (`main.py`, `server.py`) shows the form, records the lead and the exact
-  consent wording the person saw, and schedules the first text. It never sends.
+  consent wording the person saw, and schedules the first text. It also takes Twilio's two
+  webhooks: incoming texts (`/twilio/incoming`) and delivery reports (`/twilio/status`). Each is
+  checked against Twilio's signature, saved, and answered at once. It never sends.
 - **The worker** (`worker.py`) answers incoming texts, queues the first text and the
   reminders (+2 hours, +1 day, +3 days), hands quiet conversations to the owner, and sends
-  what's queued.
+  what's queued (`twilio_sms.py`). A text Twilio reports as undelivered alerts the owner with
+  Twilio's error code.
 
 Every bot text is fixed wording from `text_script.py`. Jev only classifies what the homeowner
 wrote. The writer (OpenAI) drafts an answer only to an off-script question, and the guard
@@ -49,10 +52,29 @@ uv sync
 #   BUSINESS_TIMEZONE=America/Phoenix        # optional, this is the default
 #   LEAD_BOT_DB_PATH=lead_bot.db             # optional, this is the default
 #   GOOGLE_CALENDAR_ID=primary               # optional, this is the default
+#   TWILIO_ACCOUNT_SID=<starts with AC>      # all three Twilio values, or none (dry run)
+#   TWILIO_AUTH_TOKEN=<Console, Account info>
+#   TWILIO_PHONE_NUMBER=<the texting number>
+#   PUBLIC_BASE_URL=https://<machine>.<tailnet>.ts.net   # the address Twilio calls
 uv run fastapi dev src/lead_bot/main.py      # the form at http://127.0.0.1:8000/
 uv run python -m lead_bot.worker             # second terminal; dry run, texts are printed
+uv run python -m lead_bot.worker --send      # or: real texts through Twilio
 uv run python -m lead_bot.google_login       # once, before the worker books real events
 ```
+
+### Connecting Twilio
+
+1. `tailscale funnel 8000` makes the server reachable at `https://<machine>.<tailnet>.ts.net`.
+   Put exactly that in `PUBLIC_BASE_URL`: Twilio signs the URL it calls, and the server checks
+   the signature against this address, so a mismatch refuses every text with 403.
+2. In the Twilio Console, open the number's messaging settings and set "A message comes in" to
+   `<PUBLIC_BASE_URL>/twilio/incoming`, HTTP POST. Delivery reports need no setting: each send
+   asks for them at `/twilio/status`.
+3. Test with the Console's Virtual Phone (Messaging > Virtual Phone) until toll-free
+   verification is approved; real US numbers get error 30032 before then.
+
+If Twilio rejects the account SID or auth token, the worker stops with exit code 78 and puts the
+text it was sending back in the queue.
 
 ## Text the bot
 

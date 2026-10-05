@@ -3,6 +3,7 @@
 
     uv run python -m lead_bot.worker              # dry run: texts are printed, not sent
     uv run python -m lead_bot.worker --offline    # dry run with keyword stand-ins, no keys needed
+    uv run python -m lead_bot.worker --send       # real texts through Twilio (twilio_sms.py)
 
 Each pass of the loop does, in order:
   1. answer the incoming texts that are waiting (Store.claim_incoming_text)
@@ -14,9 +15,9 @@ Every step reads its work from the database and writes the result back in one tr
 crash or restart loses nothing (see store.py). The web server only ever adds rows; this is the
 only process that sends.
 
-Phase 1 has no Twilio: incoming texts come from the simulator (simulate.py) or the scenario
-runner, and the sender prints texts instead of sending them. Phase 2 adds the Twilio webhook and
-a TwilioSender with the same send method.
+Incoming texts come from Twilio's webhook (server.py), or from the simulator and the scenario
+runner, which save them the same way. Texts go out through TwilioSender with --send, and are
+printed otherwise.
 """
 
 from __future__ import annotations
@@ -65,6 +66,17 @@ IDLE_SECONDS = 2.0
 class SendRefused(Exception):
     """The provider refused the text outright (a bad number, the recipient opted out). It was
     certainly not sent."""
+
+    def __init__(self, message: str, recipient_opted_out: bool = False) -> None:
+        super().__init__(message)
+        # True when the provider refused because the person opted out with it (Twilio's 21610:
+        # they texted STOP and the webhook never reached us). The bot's own list must learn it.
+        self.recipient_opted_out = recipient_opted_out
+
+
+class SenderCredentialsRejected(Exception):
+    """The provider refused the bot's own credentials. Every send would fail the same way, so
+    the text goes back to the queue untouched and the worker stops (main exits with 78)."""
 
 
 class Sender(Protocol):
@@ -250,8 +262,17 @@ class Worker:
             return True
         try:
             provider_message_id = self._sender.send(outgoing.phone, outgoing.body)
+        except SenderCredentialsRejected:
+            # Not this text's fault: put it back as it was and stop, so the whole queue isn't
+            # marked failed one text at a time.
+            self._store.return_text_to_queue(outgoing.text_id)
+            raise
         except SendRefused as error:
             self._store.mark_text_failed(outgoing.text_id, str(error), self._clock())
+            if error.recipient_opted_out:
+                # They texted STOP but the webhook never reached us; our own list must learn it.
+                source = "the texting provider says they opted out"
+                self._store.add_to_do_not_call(outgoing.phone, source, self._clock())
             return True
         except Exception as error:
             logger.exception("text %d: send failed; it may or may not have gone", outgoing.text_id)
@@ -281,11 +302,13 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--offline", action="store_true", help="keyword stand-ins for Jev and the calendar")
+    parser.add_argument("--send", action="store_true", help="send real texts through Twilio")
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     load_dotenv()
     settings = BusinessSettings.from_environment()
     store = Store(database_path_from_environment())
+    sender = _build_sender(arguments.send, settings)
     if arguments.offline:
         from .stand_ins import offline_services
 
@@ -294,8 +317,34 @@ def main() -> None:
         from .wiring import build_conversation_services
 
         services = build_conversation_services(settings)
-    print("[worker] dry run: texts are printed, not sent. Ctrl+C to stop.")
-    Worker(store, settings, services, PrintingSender()).run_forever()
+    try:
+        Worker(store, settings, services, sender).run_forever()
+    except SenderCredentialsRejected as error:
+        logger.critical(
+            "Twilio rejected TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN (%s). Fix them in .env and start "
+            "the worker again. No texts were lost: the one being sent is back in the queue.",
+            error,
+        )
+        # 78 (EX_CONFIG): the systemd unit doesn't restart on it, since a restart would fail the same way.
+        raise SystemExit(78) from None
+
+
+def _build_sender(send_for_real: bool, settings: BusinessSettings) -> Sender:
+    if not send_for_real:
+        print("[worker] dry run: texts are printed, not sent. Add --send to text for real. Ctrl+C to stop.")
+        return PrintingSender()
+    from .twilio_sms import TwilioSender, TwilioSettings, status_callback_url
+
+    twilio_settings = TwilioSettings.from_environment()
+    if twilio_settings is None:
+        raise SystemExit(
+            "[worker] --send needs TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER in .env"
+        )
+    callback_url = status_callback_url(settings.public_base_url)
+    if callback_url is None:
+        print("[worker] PUBLIC_BASE_URL isn't https://, so Twilio can't report delivery back to us.")
+    print(f"[worker] sending real texts from {twilio_settings.phone_number}. Ctrl+C to stop.")
+    return TwilioSender(twilio_settings, callback_url)
 
 
 if __name__ == "__main__":

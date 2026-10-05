@@ -91,6 +91,7 @@ class RecordingSender:
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []  # (phone, body)
+        self.message_ids: list[str] = []  # the provider id returned for each, in order
         self.refuse: str | None = None
         self.fail: Exception | None = None
 
@@ -104,7 +105,8 @@ class RecordingSender:
         if self.fail is not None:
             raise self.fail
         self.sent.append((phone, body))
-        return f"SM{len(self.sent)}"
+        self.message_ids.append(f"SM{len(self.sent)}")
+        return self.message_ids[-1]
 
 
 class Clock:

@@ -18,11 +18,13 @@ from dotenv import load_dotenv
 from .server import create_app
 from .settings import BusinessSettings, database_path_from_environment
 from .store import Store
+from .twilio_sms import TwilioSettings
 
 load_dotenv()
 
 _settings = BusinessSettings.from_environment()  # stops here, naming what's missing
 _store = Store(database_path_from_environment())
 
-# Module-level `app`: the name fastapi's CLI looks for by default.
-app = create_app(_store, _settings)
+# Module-level `app`: the name fastapi's CLI looks for by default. Twilio settings are optional
+# until the texting webhooks are used (create_app answers them with 503 without).
+app = create_app(_store, _settings, twilio=TwilioSettings.from_environment())
