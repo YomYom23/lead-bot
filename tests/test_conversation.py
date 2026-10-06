@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from conftest import DANA_PHONE, make_consent, make_lead
+from conftest import DANA_PHONE, make_consent, make_lead, phoenix
 from test_booking import FakeCalendar
 from text_fakes import (
     FIRST_OFFERED_TIME,
@@ -21,12 +21,17 @@ from text_fakes import (
 )
 
 from lead_bot.jev import JevError
+from lead_bot.slots import BusyPeriod
 from lead_bot.store import Store
 from lead_bot.text_script import (
     INSURANCE_LINE,
+    LATER_TIMES_PREFIX,
+    NO_TIME_SUITED_TEXT,
     PRICE_LINE,
     QUESTION_FOR_TEAM_LINE,
     first_text,
+    inspection_hours_text,
+    off_topic_text,
     opt_out_confirmation,
 )
 from lead_bot.worker import MAX_TRIES_PER_TEXT, RETRY_DELAY, Worker
@@ -272,3 +277,61 @@ def test_a_second_form_while_a_conversation_runs_sends_no_second_first_text(stor
     store.add_lead(make_lead(), make_consent(), clock(), SETTINGS.texting_hours)
     worker.run_once()
     assert len(sender.sent) == 1
+
+
+# ---- small talk, and times that don't suit ----
+
+
+def test_flirting_gets_a_fixed_redirect_with_no_team_promise_and_no_alert(store: Store) -> None:
+    _, sender, _, _ = run(store, ScriptedJev("off_topic"), ["You seem cute, are you single?"])
+    assert sender.bodies[1] == f"{off_topic_text(SETTINGS)} Is the inspection for 12 Saguaro Ln, Mesa AZ?"
+    assert QUESTION_FOR_TEAM_LINE not in sender.bodies[1]
+    assert alerts(store) == []
+
+
+def test_small_talk_twice_in_a_row_goes_to_a_person(store: Store) -> None:
+    _, _, _, lead_id = run(
+        store, ScriptedJev("off_topic", "off_topic"), ["you're cute", "so are you single?"]
+    )
+    assert store.conversation_result(lead_id) == "not_understood"
+    assert alerts(store) == ["bot_could_not_understand"]
+
+
+def offered_times(body: str) -> list[str]:
+    return [line.split(") ", 1)[1] for line in body.splitlines() if line[:2] in ("1)", "2)", "3)")]
+
+
+def test_none_of_the_times_gets_the_hours_and_later_days_once(store: Store) -> None:
+    jev = ScriptedJev(*QUALIFYING_ANSWERS, "none", FIRST_OFFERED_TIME)
+    texts = ["yes", "no", "no", "yes", "Can you do Saturday at noon instead?", "the first one"]
+    _, sender, _, lead_id = run(store, jev, texts)
+
+    first_offer, later_offer = sender.bodies[-3], sender.bodies[-2]
+    assert later_offer.startswith(f"{LATER_TIMES_PREFIX} {inspection_hours_text(SETTINGS)}")
+    assert "We do inspections Monday to Friday, 8 AM to 5 PM." in later_offer
+    # Every later time is on a day after the last one first offered.
+    first_days = [label.rsplit(" at ", 1)[0] for label in offered_times(first_offer)]
+    later_days = [label.rsplit(" at ", 1)[0] for label in offered_times(later_offer)]
+    assert len(later_days) == 3 and not set(first_days) & set(later_days)
+    assert store.booking_label(lead_id) == offered_times(later_offer)[0]
+    assert alerts(store) == []
+
+
+def test_turning_down_the_later_times_too_goes_to_a_person(store: Store) -> None:
+    jev = ScriptedJev(*QUALIFYING_ANSWERS, "none", "none")
+    _, sender, _, lead_id = run(
+        store, jev, ["yes", "no", "no", "yes", "none of those", "none of those either"]
+    )
+    assert sender.bodies[-1] == NO_TIME_SUITED_TEXT
+    assert store.conversation_result(lead_id) == "no_time_suited"
+    assert alerts(store) == ["needs_a_different_inspection_time"]
+
+
+def test_with_no_later_times_open_it_goes_straight_to_a_person(store: Store) -> None:
+    # Everything from Thursday on is taken, so only Monday to Wednesday were ever open.
+    thursday = phoenix(2026, 10, 8, 0, 0)
+    calendar = FakeCalendar(busy=[BusyPeriod(thursday, thursday + timedelta(days=30))])
+    jev = ScriptedJev(*QUALIFYING_ANSWERS, "none")
+    _, sender, _, lead_id = run(store, jev, ["yes", "no", "no", "yes", "none of those"], calendar=calendar)
+    assert sender.bodies[-1] == NO_TIME_SUITED_TEXT
+    assert store.conversation_result(lead_id) == "no_time_suited"

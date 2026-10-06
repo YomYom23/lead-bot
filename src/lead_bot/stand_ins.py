@@ -63,8 +63,10 @@ class OfflineJev:
                     return slot_ids[position]
             if re.search(r"\blast\b", text):
                 return slot_ids[-1]
-            if re.search(r"\b(none|neither|different|another)\b", text):
+            if re.search(r"\b(none|neither|different|another|instead|weekends?)\b", text):
                 return "none"
+        if re.search(r"\b(cute|single|date|gorgeous|handsome)\b", text):
+            return "off_topic"
         if re.search(r"\b(cover|deductible|adjuster)\b", text):
             return "insurance_question"
         if re.search(r"\b(how much|cost|price)\b", text):

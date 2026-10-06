@@ -3,13 +3,19 @@
 # alphabet and segment counts, Twilio's keywords, and picking a time by number.
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 from text_fakes import SETTINGS
 
 from lead_bot.conversation import is_explicit_opt_out
 from lead_bot.leads import pretty_phone
+from lead_bot.slots import BookingRules
 from lead_bot.text_script import (
+    closed_days_text,
+    conversation_facts,
     help_text,
+    inspection_days_text,
     is_gsm7,
     opening_text,
     opt_out_confirmation,
@@ -160,3 +166,24 @@ def test_a_bare_number_picks_that_offered_time(text: str, number: int | None) ->
 
 def test_a_number_inside_a_sentence_is_left_to_jev() -> None:
     assert picked_number("2 kids will be home", offered_count=3) is None
+
+
+# ---- inspection days and hours ----
+
+
+def rules_with_days(*weekdays: int) -> BookingRules:
+    return dataclasses.replace(SETTINGS.inspection_rules, open_weekdays=frozenset(weekdays))
+
+
+def test_a_run_of_days_reads_as_a_range_and_the_rest_as_a_list() -> None:
+    assert inspection_days_text(rules_with_days(0, 1, 2, 3, 4)) == "Monday to Friday"
+    assert inspection_days_text(rules_with_days(0, 2, 4)) == "Monday, Wednesday and Friday"
+    assert inspection_days_text(rules_with_days(5, 6)) == "Saturday and Sunday"
+    assert closed_days_text(rules_with_days(0, 1, 2, 3, 4)) == "Saturday or Sunday"
+    assert closed_days_text(rules_with_days(*range(7))) is None
+
+
+def test_the_writer_is_told_the_closed_days_outright() -> None:
+    facts = conversation_facts(SETTINGS, ADDRESS, booked_label=None)
+    assert "Inspections can be booked Monday to Friday, between 8 AM and 5 PM" in facts
+    assert "There are no inspections on Saturday or Sunday." in facts

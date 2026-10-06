@@ -24,7 +24,7 @@ from typing import Literal
 
 from .leads import pretty_phone
 from .settings import BusinessSettings
-from .slots import Slot
+from .slots import BookingRules, Slot
 from .text_questions import Stage
 from .timing import MAX_TEXT_ATTEMPTS
 
@@ -168,8 +168,9 @@ def stage_question(stage: Stage, address: str, offered_slots: Sequence[Slot]) ->
             return "Are you the owner of the home?"
         case "offer":
             times = "\n".join(f"{number}) {slot.label}" for number, slot in enumerate(offered_slots, start=1))
+            # Not "the earliest times": after "none of those work" the bot offers later ones.
             return (
-                f"The earliest inspection times I have are:\n{times}\n"
+                f"These inspection times are open:\n{times}\n"
                 "Reply with the number of the one that works best."
             )
         case "booked":
@@ -202,6 +203,9 @@ NOT_HOMEOWNER_TEXT = (
     "Thanks. The inspection needs the owner's OK, so someone from our team will follow up with you."
 )
 NO_TIME_SUITED_TEXT = "No problem. Someone from our team will contact you to find a time that works."
+# Starts the one re-offer after "none of those work". conversation.py looks for it in the
+# history to know the re-offer already happened, so it must stay the start of that text.
+LATER_TIMES_PREFIX = "Here are some later times."
 CHANGE_BOOKING_TEXT = "No problem. Someone from our team will contact you to change it."
 CALENDAR_DOWN_TEXT = (
     "I can't reach our scheduling system right now. Someone from our team will contact you to set "
@@ -282,6 +286,50 @@ def _clock_time(clock_time: time) -> str:
     return f"{hour_on_12_hour_clock}{minutes} {'AM' if clock_time.hour < 12 else 'PM'}"
 
 
+def _join_words(words: Sequence[str], last_joiner: str) -> str:
+    """['a'] -> 'a', ['a', 'b'] -> 'a and b', ['a', 'b', 'c'] -> 'a, b and c'."""
+    if len(words) <= 1:
+        return "".join(words)
+    return f"{', '.join(words[:-1])} {last_joiner} {words[-1]}"
+
+
+def inspection_days_text(rules: BookingRules) -> str:
+    """'Monday to Friday' for a run of days, 'Monday, Wednesday and Friday' otherwise."""
+    weekdays = sorted(rules.open_weekdays)
+    names = [WEEKDAY_NAMES[weekday] for weekday in weekdays]
+    is_a_run = weekdays == list(range(weekdays[0], weekdays[-1] + 1))
+    if is_a_run and len(names) > 2:
+        return f"{names[0]} to {names[-1]}"
+    return _join_words(names, "and")
+
+
+def closed_days_text(rules: BookingRules) -> str | None:
+    """'Saturday or Sunday': the days with no inspections. None when every day is open."""
+    closed = [name for weekday, name in enumerate(WEEKDAY_NAMES) if weekday not in rules.open_weekdays]
+    return _join_words(closed, "or") if closed else None
+
+
+def inspection_hours_text(settings: BusinessSettings) -> str:
+    rules = settings.inspection_rules
+    return (
+        f"We do inspections {inspection_days_text(rules)}, "
+        f"{_clock_time(rules.opening_time)} to {_clock_time(rules.closing_time)}."
+    )
+
+
+def later_times_text(settings: BusinessSettings) -> str:
+    """Before the re-offered times. The offer question itself follows it."""
+    return f"{LATER_TIMES_PREFIX} {inspection_hours_text(settings)}"
+
+
+def off_topic_text(settings: BusinessSettings) -> str:
+    """For flirting and small talk: friendly, no team promise, and no alert to the owner."""
+    return (
+        f"I'm an automated assistant for {settings.business_name}, so I can only help with your "
+        "roof inspection."
+    )
+
+
 def conversation_facts(settings: BusinessSettings, address: str, booked_label: str | None) -> str:
     """Everything the writer is allowed to state in this conversation, one fact per line.
 
@@ -289,22 +337,25 @@ def conversation_facts(settings: BusinessSettings, address: str, booked_label: s
     fact missing here gets the draft blocked rather than invented.
     """
     rules = settings.inspection_rules
-    open_days = [WEEKDAY_NAMES[weekday] for weekday in sorted(rules.open_weekdays)]
     inspection_minutes = int(rules.appointment_length.total_seconds() // 60)
     booking = (
         f"An inspection is booked for {booked_label}."
         if booked_label is not None
         else "No inspection has been booked yet."
     )
+    closed_days = closed_days_text(rules)
     return "\n".join(
         [
             f"Business name: {settings.business_name}.",
             "This assistant is an artificial intelligence that texts for the business.",
             f"The business's phone number: {pretty_phone(settings.callback_phone)}.",
             f"Inspections take about {inspection_minutes} minutes.",
-            f"Inspections can be booked {open_days[0]} to {open_days[-1]}, between "
+            f"Inspections can be booked {inspection_days_text(rules)}, between "
             f"{_clock_time(rules.opening_time)} and {_clock_time(rules.closing_time)}, "
             f"up to {rules.days_ahead} days ahead.",
+            # Said outright: given only "Monday to Friday", the writer answered "do you do
+            # Saturdays?" with NOT_IN_FACTS instead of working out the no.
+            *([f"There are no inspections on {closed_days}."] if closed_days else []),
             f"The inspection address on file: {address}.",
             booking,
             *PLACEHOLDER_BUSINESS_FACTS,

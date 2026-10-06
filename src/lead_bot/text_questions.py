@@ -52,6 +52,11 @@ OFF_SCRIPT_OPTIONS: dict[str, str] = {
     "or handling an insurance claim",
     "price_question": "Asks what something costs",
     "other_question": "Asks some other question instead of answering",
+    # Flirting and small talk get a fixed redirect, not a writer answer passed to the team.
+    # Sexually explicit or threatening texts are the abusive hazard, not this.
+    "off_topic": "Flirts, jokes, makes small talk, or asks the assistant something personal that has "
+    "nothing to do with the roof, the inspection, or the company. Asking which company this is or "
+    "whether this is an automated assistant is other_question, not this",
     "repeat": "Asks what the assistant meant, or says they don't understand the question",
     "later": "Says they're busy right now and will answer later",
     "unclear": "Says something that fits none of the other options",
@@ -99,12 +104,13 @@ def build_questions(stage: Stage, offered_slots: Sequence[Slot]) -> dict[str, Qu
         # The options ARE the offered times, so Jev can only return a time that was offered,
         # never one it made up. They carry the numbers the offer text showed, so "the 2nd one"
         # can be matched too. (A reply that is just a number never reaches Jev.)
-        # A question about other days ("do you do Saturdays?") must not land on NO_SLOT_OPTION:
-        # it hands the conversation to a person. Questions go to other_question instead.
+        # A question about other days ("do you do Saturdays?") is other_question, answered from
+        # the facts. Asking for a time that wasn't offered is NO_SLOT_OPTION: the bot then
+        # states its days and hours and offers later times once (conversation._no_time_suited).
         stage_options = {
             **{slot.id: f"{number}) {slot.label}" for number, slot in enumerate(offered_slots, start=1)},
-            NO_SLOT_OPTION: "Turns down all of these times, or says they want a different day or time. "
-            "Not a question about which days or times are possible",
+            NO_SLOT_OPTION: "Turns down all of these times, or asks for a different day or time, like "
+            "'Saturday at noon'. Not a question about which days or times are possible",
         }
     else:
         stage_options = STAGE_OPTIONS[stage]

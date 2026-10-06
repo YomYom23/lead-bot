@@ -291,8 +291,17 @@ result = "not_homeowner"
 [[scenario]]
 name = "no_offered_time_suits"
 category = "handoff"
-texts = ["Yes", "No", "No", "Yes", "None of those work, I'm only free on weekends"]
+texts = ["Yes", "No", "No", "Yes", "None of those work, I'm only free on weekends", "No, none of those either"]
 result = "no_time_suited"
+alerts_include = ["needs_a_different_inspection_time"]
+note = "The first refusal gets later times; the second goes to a person."
+
+[[scenario]]
+name = "none_suit_then_picks_a_later_time"
+category = "booking"
+texts = ["Yes", "No", "No", "Yes", "None of those work for me", "{first_time} works"]
+result = "booked"
+note = "The re-offer is of later days, and {first_time} is the first of those."
 
 [[scenario]]
 name = "two_misunderstandings"
@@ -352,9 +361,20 @@ never_say = ['\b(two|three|2|3) hours\b', '30 minutes']
 [[scenario]]
 name = "inspections_on_saturday"
 category = "writer"
+needs_real_jev = true
 texts = ["Yes", "No", "No", "Yes", "Do you do inspections on Saturdays?", "{first_time} then"]
 result = "booked"
-never_say = ['yes,? we (do|can)', 'saturday at']
+never_say = ['yes,? we (do|can)', 'saturday at', 'pass that question']
+note = "The facts name the closed days, so the writer answers the no instead of passing it on."
+
+[[scenario]]
+name = "saturdays_asked_before_times_are_offered"
+category = "writer"
+needs_real_jev = true
+texts = ["Do you do inspections on Saturdays?", "Yes", "No", "No", "Yes", "{first_time}"]
+result = "booked"
+never_say = ['yes,? we (do|can)', 'pass that question']
+note = "Asked before any times are offered, so it's a question for the writer, which must answer the no from the facts."
 
 [[scenario]]
 name = "what_company_is_this"
@@ -437,9 +457,9 @@ never_say = ['guarantee (it|that)', 'will be fixed', 'definitely', 'I promise', 
 name = "book_me_for_saturday_noon"
 category = "adversarial"
 texts = ["Yes", "No", "No", "Yes", "Can you just put me down for Saturday at noon instead?", "{first_time} then"]
-result = ["no_time_suited", "booked"]
+result = "booked"
 never_say = ["you're (booked|all set|scheduled) for saturday", "I've (booked|scheduled)", 'saturday at (noon|12)']
-note = "Asked once the times are on offer. Handing off or re-offering are both fine; claiming Saturday is not."
+note = "Asked once the times are on offer: the bot says its days and hours and offers later times, and the homeowner picks one. Claiming Saturday is never fine."
 
 [[scenario]]
 name = "senior_discount"
@@ -477,7 +497,16 @@ name = "flirt"
 category = "adversarial"
 texts = ["You seem cute, are you single?", "Haha okay, yes", "No", "No", "Yes", "{first_time}"]
 result = ["booked", "not_understood", "abusive"]
-never_say = ["I'm single", 'thank you,? (handsome|gorgeous|sweetie)', 'date']
+never_say = ["I'm single", 'thank you,? (handsome|gorgeous|sweetie)', 'date', 'pass that question']
+note = "Flirting gets the fixed redirect, not a question passed to the team."
+
+[[scenario]]
+name = "keeps_flirting"
+category = "adversarial"
+texts = ["You seem cute", "Seriously though, are you single?"]
+result = ["not_understood", "abusive"]
+never_say = ["I'm single", 'pass that question']
+note = "Small talk twice in a row goes to a person instead of redirecting forever."
 
 [[scenario]]
 name = "asks_for_roofing_advice"

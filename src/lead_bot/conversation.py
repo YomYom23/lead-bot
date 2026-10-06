@@ -31,7 +31,7 @@ from .guard import REPLY_CHECKS, find_reply_problems
 from .jev import Answer, JevError, choice_answer, yes_probability
 from .leads import PROBLEM_LABELS
 from .settings import BusinessSettings
-from .slots import earliest_per_day
+from .slots import earliest_per_day, local_day
 from .text_questions import NO_SLOT_OPTION, OFF_SCRIPT_OPTIONS, Stage, build_questions
 from .text_script import (
     ADDRESS_WRONG_PREFIX,
@@ -41,6 +41,7 @@ from .text_script import (
     CONFUSION_PREFIX,
     INSURANCE_LINE,
     LATER_TEXT,
+    LATER_TIMES_PREFIX,
     NO_TIME_SUITED_TEXT,
     NOT_CAUGHT_PREFIX,
     NOT_HOMEOWNER_TEXT,
@@ -52,7 +53,9 @@ from .text_script import (
     WRONG_PERSON_TEXT,
     booked_text,
     conversation_facts,
+    later_times_text,
     not_understood_text,
+    off_topic_text,
     opt_out_confirmation,
     picked_number,
     plain_punctuation,
@@ -241,9 +244,7 @@ class Conversation:
                 self._offer_times(prefix="Thanks.")
         elif stage == "offer":
             if option == NO_SLOT_OPTION:
-                self._hand_off(
-                    NO_TIME_SUITED_TEXT, result="no_time_suited", alert="needs_a_different_inspection_time"
-                )
+                self._no_time_suited()
             elif option in {slot.id for slot in self._state.offered_slots}:
                 self._book(option)
             else:
@@ -271,6 +272,18 @@ class Conversation:
             # person after a day (Store.close_quiet_conversations).
             self._outcome.unclear_in_a_row = 0
             self._reply(LATER_TEXT)
+        elif option == "off_topic":
+            # Counts like a misunderstanding, so flirting that won't stop ends with a person
+            # rather than the bot redirecting forever. No owner alert for a single one.
+            self._outcome.unclear_in_a_row += 1
+            if self._outcome.unclear_in_a_row >= MAX_UNCLEAR_IN_A_ROW:
+                self._hand_off(
+                    not_understood_text(self._settings),
+                    result="not_understood",
+                    alert="bot_could_not_understand",
+                )
+            else:
+                self._reply_then_ask(off_topic_text(self._settings))
         else:  # unclear
             self._outcome.unclear_in_a_row += 1
             if self._outcome.unclear_in_a_row >= MAX_UNCLEAR_IN_A_ROW:
@@ -338,6 +351,44 @@ class Conversation:
         """The fixed answer to a question the bot can't answer itself: a person follows up."""
         self._outcome.owner_alerts.append(f"homeowner_question_for_the_team:{why}")
         self._reply_then_ask(QUESTION_FOR_TEAM_LINE)
+
+    def _no_time_suited(self) -> None:
+        """None of the offered times work, or they asked for one that wasn't offered.
+
+        The first time, say when inspections happen and offer times on later days: "Saturday at
+        noon" or "none of those" usually means those days, not that no time could ever work.
+        After that one re-offer, or when there are no later times, a person takes over.
+        """
+        already_reoffered = any(
+            turn.role == "assistant" and turn.text.startswith(LATER_TIMES_PREFIX) for turn in self._history
+        )
+        if already_reoffered:
+            self._hand_off(
+                NO_TIME_SUITED_TEXT, result="no_time_suited", alert="needs_a_different_inspection_time"
+            )
+            return
+        try:
+            open_slots = self._services.booking().get_open_slots()
+        except (CalendarUnavailable, GoogleAuthExpired) as error:
+            self._calendar_failed(error)
+            return
+        timezone = self._settings.timezone
+        offered_days = {local_day(slot, timezone) for slot in self._state.offered_slots}
+        last_offered_day = max((day for day in offered_days if day is not None), default=None)
+        later_slots = [
+            slot
+            for slot in open_slots
+            if (day := local_day(slot, timezone)) is not None
+            and (last_offered_day is None or day > last_offered_day)
+        ]
+        later = earliest_per_day(later_slots, TIMES_OFFERED, timezone)
+        if not later:
+            self._hand_off(
+                NO_TIME_SUITED_TEXT, result="no_time_suited", alert="needs_a_different_inspection_time"
+            )
+            return
+        self._outcome.offered_slots = tuple(later)
+        self._ask("offer", prefix=later_times_text(self._settings))
 
     def _offer_times(self, prefix: str) -> None:
         try:
