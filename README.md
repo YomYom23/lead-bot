@@ -30,6 +30,13 @@ Two processes share one SQLite file:
   what's queued (`twilio_sms.py`). A text Twilio reports as undelivered alerts the owner with
   Twilio's error code.
 
+Whenever a person has to act (an active leak, a request for a person, a question the bot
+couldn't answer, a text that wasn't delivered), the bot raises an owner alert, and the worker
+emails it to the owner (`owner_alerts.py`): one email per alert, with the lead's details, their
+answers and the whole conversation. Urgent ones say URGENT in the subject. A failed email is
+retried, never dropped. `worker --send` won't start without alert email, because the bot tells
+homeowners things like "I'll flag this as urgent for our team".
+
 Every bot text is fixed wording from `text_script.py`. Jev only classifies what the homeowner
 wrote. The writer (OpenAI) drafts an answer only to an off-script question, and the guard
 (Jev checks plus regex backstops) must pass the draft before it is sent; otherwise the
@@ -56,11 +63,25 @@ uv sync
 #   TWILIO_AUTH_TOKEN=<Console, Account info>
 #   TWILIO_PHONE_NUMBER=<the texting number>
 #   PUBLIC_BASE_URL=https://<machine>.<tailnet>.ts.net   # the address Twilio calls
+#   OWNER_ALERT_EMAIL=<where owner alerts go>            # all three alert values, or none
+#   SMTP_USERNAME=<the Gmail address that sends them>
+#   SMTP_PASSWORD=<a Gmail app password, not the account password>
 uv run fastapi dev src/lead_bot/main.py      # the form at http://127.0.0.1:8000/
 uv run python -m lead_bot.worker             # second terminal; dry run, texts are printed
 uv run python -m lead_bot.worker --send      # or: real texts through Twilio
+uv run python -m lead_bot.owner_alerts --test  # one test email, to check the alert settings
 uv run python -m lead_bot.google_login       # once, before the worker books real events
 ```
+
+### Setting up owner alert email (Gmail)
+
+1. Turn on 2-Step Verification for the sending Google account.
+2. Create an app password at myaccount.google.com/apppasswords and put it in `SMTP_PASSWORD`
+   (the spaces Google shows don't matter).
+3. Run `uv run python -m lead_bot.owner_alerts --test` and check the inbox.
+
+Without these, the dry-run worker prints each alert email instead, and none is marked as sent,
+so they all go out once email is set up.
 
 ### Connecting Twilio
 

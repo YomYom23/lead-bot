@@ -138,7 +138,19 @@ CREATE TABLE IF NOT EXISTS owner_alerts (
     alert_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     lead_id    INTEGER REFERENCES leads (lead_id),  -- NULL: about a number with no lead
     reason     TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    text_id    INTEGER REFERENCES texts (text_id)   -- the incoming text behind it, if one was
+);
+
+-- Which owner alerts have been emailed (owner_alerts.py). Kept apart from owner_alerts so a
+-- database made before alert emails existed needs no change: an alert with no row here is
+-- simply not emailed yet.
+CREATE TABLE IF NOT EXISTS alert_emails (
+    alert_id   INTEGER PRIMARY KEY REFERENCES owner_alerts (alert_id),
+    sent_at    REAL,                        -- NULL until it has gone
+    tries      INTEGER NOT NULL DEFAULT 0,
+    not_before REAL,                        -- after a failure: not tried again before this
+    last_error TEXT
 );
 """
 
@@ -243,6 +255,31 @@ class OwnerAlert:
     created_at: datetime
 
 
+@dataclass(frozen=True)
+class AlertForEmail:
+    """An owner alert not emailed yet, with everything the email shows about it."""
+
+    alert_id: int
+    reason: str
+    created_at: datetime
+    tries: int  # failed attempts so far
+    lead: LeadSummary | None  # None for a text from a number the bot never texted
+    text_phone: str | None  # the incoming text behind the alert, if there was one
+    text_body: str | None
+
+
+@dataclass(frozen=True)
+class LeadSummary:
+    lead_id: int
+    full_name: str
+    phone: str
+    address: str
+    problem: str
+    answers: dict[str, str]
+    booking: str | None
+    transcript: list[TranscriptLine]
+
+
 class Store:
     def __init__(self, database_path: Path | str) -> None:
         self._path = str(database_path)
@@ -251,6 +288,13 @@ class Store:
             # WAL lets the web server write while the worker reads, instead of one blocking.
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(SCHEMA)
+            # CREATE TABLE IF NOT EXISTS leaves an existing table as it was, so a column added
+            # later has to be added to databases made before it.
+            alert_columns = {row["name"] for row in connection.execute("PRAGMA table_info(owner_alerts)")}
+            if "text_id" not in alert_columns:
+                connection.execute(
+                    "ALTER TABLE owner_alerts ADD COLUMN text_id INTEGER REFERENCES texts (text_id)"
+                )
         finally:
             connection.close()
 
@@ -673,7 +717,7 @@ class Store:
                     connection, lead_id, lead["phone"], "stop_confirmation", outcome.stop_confirmation, now
                 )
             for reason in outcome.owner_alerts:
-                _add_owner_alert(connection, lead_id, reason, now)
+                _add_owner_alert(connection, lead_id, reason, now, text_id=text_id)
 
     def finish_incoming_outside_conversation(
         self,
@@ -703,7 +747,7 @@ class Store:
                         connection, row["lead_id"], row["phone"], "stop_confirmation", confirmation, now
                     )
             if alert is not None:
-                _add_owner_alert(connection, row["lead_id"], alert, now)
+                _add_owner_alert(connection, row["lead_id"], alert, now, text_id=text_id)
 
     # ---- outgoing texts ----
 
@@ -898,6 +942,53 @@ class Store:
             for row in rows
         ]
 
+    # ---- owner alert emails (owner_alerts.py) ----
+
+    def alerts_to_email(self, now: datetime, limit: int = 10) -> list[AlertForEmail]:
+        """Owner alerts not emailed yet whose retry time (after a failure) has come, oldest first."""
+        with self._read() as connection:
+            rows = connection.execute(
+                "SELECT owner_alerts.alert_id, owner_alerts.lead_id, owner_alerts.reason, "
+                "owner_alerts.created_at, COALESCE(alert_emails.tries, 0) AS tries, "
+                "texts.phone AS text_phone, texts.body AS text_body "
+                "FROM owner_alerts "
+                "LEFT JOIN alert_emails ON alert_emails.alert_id = owner_alerts.alert_id "
+                "LEFT JOIN texts ON texts.text_id = owner_alerts.text_id "
+                "WHERE alert_emails.sent_at IS NULL "
+                "AND (alert_emails.not_before IS NULL OR alert_emails.not_before <= ?) "
+                "ORDER BY owner_alerts.alert_id LIMIT ?",
+                (now.timestamp(), limit),
+            ).fetchall()
+            return [
+                AlertForEmail(
+                    alert_id=row["alert_id"],
+                    reason=row["reason"],
+                    created_at=datetime.fromtimestamp(row["created_at"], UTC),
+                    tries=row["tries"],
+                    lead=None if row["lead_id"] is None else _lead_summary(connection, row["lead_id"]),
+                    text_phone=row["text_phone"],
+                    text_body=row["text_body"],
+                )
+                for row in rows
+            ]
+
+    def mark_alert_emailed(self, alert_id: int, now: datetime) -> None:
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO alert_emails (alert_id, sent_at, tries) VALUES (?, ?, 0) "
+                "ON CONFLICT (alert_id) DO UPDATE SET sent_at = excluded.sent_at, last_error = NULL",
+                (alert_id, now.timestamp()),
+            )
+
+    def retry_alert_email_later(self, alert_id: int, error: str, not_before: datetime) -> None:
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO alert_emails (alert_id, tries, not_before, last_error) VALUES (?, 1, ?, ?) "
+                "ON CONFLICT (alert_id) DO UPDATE SET tries = alert_emails.tries + 1, "
+                "not_before = excluded.not_before, last_error = excluded.last_error",
+                (alert_id, not_before.timestamp(), error[:500]),
+            )
+
     def counts(self) -> dict[str, dict[str, int]]:
         """Leads by status, and texts by status in each direction, for /health."""
         with self._read() as connection:
@@ -915,6 +1006,34 @@ class Store:
 
 
 # ---- helpers that run inside a caller's transaction ----
+
+
+def _lead_summary(connection: sqlite3.Connection, lead_id: int) -> LeadSummary | None:
+    """What an alert email says about the lead: who, where, the answers and every text."""
+    lead = connection.execute(
+        "SELECT full_name, phone, address, problem FROM leads WHERE lead_id = ?", (lead_id,)
+    ).fetchone()
+    if lead is None:
+        return None
+    answers = connection.execute(
+        "SELECT question, answer FROM lead_answers WHERE lead_id = ?", (lead_id,)
+    ).fetchall()
+    booking = connection.execute("SELECT slot_label FROM bookings WHERE lead_id = ?", (lead_id,)).fetchone()
+    texts = connection.execute(
+        "SELECT direction, kind, body, status FROM texts WHERE lead_id = ? ORDER BY text_id", (lead_id,)
+    ).fetchall()
+    return LeadSummary(
+        lead_id=lead_id,
+        full_name=lead["full_name"],
+        phone=lead["phone"],
+        address=lead["address"],
+        problem=lead["problem"],
+        answers={row["question"]: row["answer"] for row in answers},
+        booking=None if booking is None else str(booking["slot_label"]),
+        transcript=[
+            TranscriptLine(row["direction"], row["kind"], row["body"], row["status"]) for row in texts
+        ],
+    )
 
 
 def _is_on_do_not_call(connection: sqlite3.Connection, phone: str) -> bool:
@@ -947,10 +1066,16 @@ def _apply_delivery_report(connection: sqlite3.Connection, provider_message_id: 
         _add_owner_alert(connection, text["lead_id"], reason, now)
 
 
-def _add_owner_alert(connection: sqlite3.Connection, lead_id: int | None, reason: str, now: datetime) -> None:
+def _add_owner_alert(
+    connection: sqlite3.Connection,
+    lead_id: int | None,
+    reason: str,
+    now: datetime,
+    text_id: int | None = None,
+) -> None:
     connection.execute(
-        "INSERT INTO owner_alerts (lead_id, reason, created_at) VALUES (?, ?, ?)",
-        (lead_id, reason, now.timestamp()),
+        "INSERT INTO owner_alerts (lead_id, reason, created_at, text_id) VALUES (?, ?, ?, ?)",
+        (lead_id, reason, now.timestamp(), text_id),
     )
 
 

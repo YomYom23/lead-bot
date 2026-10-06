@@ -11,6 +11,8 @@ Each pass of the loop does, in order:
   3. hand quiet conversations to a person
   4. send what's queued
 
+Owner alerts are emailed by a second thread (owner_alerts.py), so mail never delays a reply.
+
 Every step reads its work from the database and writes the result back in one transaction, so a
 crash or restart loses nothing (see store.py). The web server only ever adds rows; this is the
 only process that sends.
@@ -24,11 +26,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from dotenv import load_dotenv
 
@@ -45,6 +48,11 @@ from .text_script import (
 )
 from .timing import TextingHours, is_allowed, next_allowed_time, utc_now
 from .turn_data import TurnOutcome
+
+if TYPE_CHECKING:
+    # Imported for the type only: owner_alerts imports store and settings, which load fine, but
+    # keeping it out of the import chain means the scenario runner never needs email settings.
+    from .owner_alerts import OwnerAlertNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -309,6 +317,7 @@ def main() -> None:
     settings = BusinessSettings.from_environment()
     store = Store(database_path_from_environment())
     sender = _build_sender(arguments.send, settings)
+    notifier = _build_alert_notifier(arguments.send, store, settings)
     if arguments.offline:
         from .stand_ins import offline_services
 
@@ -317,6 +326,11 @@ def main() -> None:
         from .wiring import build_conversation_services
 
         services = build_conversation_services(settings)
+    # Alert emails run on their own thread: a slow mail server must never hold up a reply.
+    stop_notifier = threading.Event()
+    threading.Thread(
+        target=notifier.run_forever, args=(stop_notifier,), name="owner-alerts", daemon=True
+    ).start()
     try:
         Worker(store, settings, services, sender).run_forever()
     except SenderCredentialsRejected as error:
@@ -327,6 +341,25 @@ def main() -> None:
         )
         # 78 (EX_CONFIG): the systemd unit doesn't restart on it, since a restart would fail the same way.
         raise SystemExit(78) from None
+    finally:
+        stop_notifier.set()
+
+
+def _build_alert_notifier(
+    send_for_real: bool, store: Store, settings: BusinessSettings
+) -> OwnerAlertNotifier:
+    from .owner_alerts import EMAIL_VARIABLES, EmailSettings, build_notifier
+
+    email = EmailSettings.from_environment()
+    if email is None and send_for_real:
+        # Real homeowners are told "I'll flag this as urgent for our team". Without alert email
+        # nobody would be told, so real texting doesn't start.
+        raise SystemExit(f"[worker] --send needs owner alert email: set {', '.join(EMAIL_VARIABLES)} in .env")
+    if email is None:
+        print("[worker] owner alerts are printed, not emailed (no OWNER_ALERT_EMAIL in .env).")
+    else:
+        print(f"[worker] owner alerts are emailed to {email.to_address}.")
+    return build_notifier(store, settings, email)
 
 
 def _build_sender(send_for_real: bool, settings: BusinessSettings) -> Sender:
