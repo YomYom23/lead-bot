@@ -16,6 +16,7 @@ from text_fakes import Clock, RecordingSender, ScriptedJev, make_services, make_
 from twilio.http.response import Response as TwilioResponse
 from twilio.request_validator import RequestValidator
 
+from lead_bot.client_config import EXAMPLE_CLIENT_CONFIG_PATH, load_client_config
 from lead_bot.server import EMPTY_TWIML, create_app
 from lead_bot.settings import BusinessSettings
 from lead_bot.store import Store
@@ -39,6 +40,7 @@ SETTINGS = BusinessSettings(
     business_name="Desert Ridge Roofing LLC",
     timezone=PHOENIX,
     texting_hours=TextingHours(PHOENIX),
+    client=load_client_config(EXAMPLE_CLIENT_CONFIG_PATH),
     public_base_url=PUBLIC_URL,
 )
 

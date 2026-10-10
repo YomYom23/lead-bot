@@ -265,17 +265,6 @@ def help_text(settings: BusinessSettings) -> str:
 
 # ---- what the writer may say ----
 
-# What the writer may say about the business beyond what conversation_facts() works out from
-# settings. PLACEHOLDER, like the inspection hours in settings.py, until a real roofer gives
-# theirs. Every sentence here can be texted to a homeowner, so nothing goes in that the business
-# hasn't approved.
-PLACEHOLDER_BUSINESS_FACTS = (
-    "The inspection is free, and agreeing to it doesn't commit the homeowner to buying anything.",
-    "The inspector documents what they find on the roof.",
-    "After the inspection the homeowner gets a written estimate for any work that's needed.",
-    "The company does roof repairs and roof replacements for homes.",
-)
-
 WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
 
@@ -358,7 +347,8 @@ def conversation_facts(settings: BusinessSettings, address: str, booked_label: s
             *([f"There are no inspections on {closed_days}."] if closed_days else []),
             f"The inspection address on file: {address}.",
             booking,
-            *PLACEHOLDER_BUSINESS_FACTS,
+            # The client's own approved sentences, from [business] facts in client.toml.
+            *settings.client.business_facts,
         ]
     )
 

@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from .booking import CalendarBooking
+from .client_config import EXAMPLE_CLIENT_CONFIG_PATH, load_client_config
 from .consent import CONSENT_VERSION, ConsentEvidence, consent_text
 from .conversation import ConversationServices
 from .leads import parse_lead_form
@@ -42,7 +43,10 @@ PHOENIX = ZoneInfo("America/Phoenix")
 # Fixed settings, the same as the scenario runner's, so a run never depends on what's in .env.
 # The callback number is the default placeholder from settings.py.
 SIMULATED_SETTINGS = BusinessSettings(
-    business_name="Desert Ridge Roofing LLC", timezone=PHOENIX, texting_hours=TextingHours(PHOENIX)
+    business_name="Desert Ridge Roofing LLC",
+    timezone=PHOENIX,
+    texting_hours=TextingHours(PHOENIX),
+    client=load_client_config(EXAMPLE_CLIENT_CONFIG_PATH),  # the placeholder roofer
 )
 SIMULATED_PHONE = "(602) 555-0142"
 WAIT_COMMAND = re.compile(r"^/wait\s+(\d+)\s*([mhd])$", re.IGNORECASE)

@@ -2,17 +2,17 @@
 """The business's settings, read from the environment (.env locally).
 
 The business name and timezone, the phone number people can call, the public address of the
-server, and the inspection hours. Twilio's own credentials come with the texting phase that
-needs them.
+server, plus the client's facts and inspection hours from client.toml (client_config.py).
+Twilio's own credentials come with the texting phase that needs them.
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .client_config import ClientConfig, client_config_path_from_environment, load_client_config
 from .leads import InvalidLeadForm, normalize_us_phone
 from .slots import BookingRules
 from .timing import TextingHours
@@ -24,24 +24,6 @@ DEFAULT_TIMEZONE = "America/Phoenix"
 DEFAULT_PUBLIC_BASE_URL = "http://127.0.0.1:8000"
 
 
-def placeholder_inspection_rules(timezone: ZoneInfo) -> BookingRules:
-    """Placeholder inspection hours until a real roofer gives theirs.
-
-    Mon-Fri 8-5, a 1-hour inspection, then 30 minutes kept free to drive to the next job. At
-    least 2 hours' notice, so an inspector is never booked for 20 minutes from now.
-    """
-    return BookingRules(
-        timezone=timezone,
-        open_weekdays=frozenset({0, 1, 2, 3, 4}),
-        opening_time=time(8, 0),
-        closing_time=time(17, 0),
-        appointment_length=timedelta(hours=1),
-        gap_after_appointment=timedelta(minutes=30),
-        minimum_notice=timedelta(hours=2),
-        days_ahead=14,
-    )
-
-
 @dataclass(frozen=True)
 class BusinessSettings:
     # The REGISTERED business name. The consent wording authorizes this seller by name, the first
@@ -50,6 +32,8 @@ class BusinessSettings:
     business_name: str
     timezone: ZoneInfo
     texting_hours: TextingHours
+    # The client's own facts and inspection hours, from client.toml (see client_config.py).
+    client: ClientConfig
     # A number people can phone: in the last reminder, the HELP reply, and the facts the writer
     # may give. Not the texting number: a toll-free texting number may not take voice calls.
     # E.164, like +14805550199.
@@ -58,7 +42,8 @@ class BusinessSettings:
 
     @property
     def inspection_rules(self) -> BookingRules:
-        return placeholder_inspection_rules(self.timezone)
+        # Built here rather than stored: the hours come from client.toml, the timezone from .env.
+        return self.client.inspection_hours.booking_rules(self.timezone)
 
     @classmethod
     def from_environment(cls) -> BusinessSettings:
@@ -86,10 +71,14 @@ class BusinessSettings:
         public_base_url = os.environ.get("PUBLIC_BASE_URL", DEFAULT_PUBLIC_BASE_URL).strip()
         if not public_base_url.startswith(("http://", "https://")):
             raise RuntimeError(f"PUBLIC_BASE_URL={public_base_url!r} must start with http:// or https://")
+        # InvalidClientConfig is a RuntimeError, so a bad client.toml stops startup the same way
+        # a bad .env value does, with a message naming the key.
+        client = load_client_config(client_config_path_from_environment())
         return cls(
             business_name=business_name,
             timezone=timezone,
             texting_hours=TextingHours(timezone),
+            client=client,
             callback_phone=callback_phone,
             public_base_url=public_base_url,
         )

@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from .booking import CalendarBooking
+from .client_config import EXAMPLE_CLIENT_CONFIG_PATH, load_client_config
 from .consent import CONSENT_VERSION, ConsentEvidence, consent_text
 from .conversation import ConversationServices
 from .leads import parse_lead_form
@@ -56,7 +57,11 @@ REPLY_DELAY = timedelta(seconds=30)
 AFTERWARDS_STEP = timedelta(hours=1)
 AFTERWARDS_FOR = timedelta(days=5)
 SCENARIO_SETTINGS = BusinessSettings(
-    business_name="Desert Ridge Roofing LLC", timezone=PHOENIX, texting_hours=TextingHours(PHOENIX)
+    business_name="Desert Ridge Roofing LLC",
+    timezone=PHOENIX,
+    texting_hours=TextingHours(PHOENIX),
+    # The placeholder roofer, not client.toml: the scenarios' expected times assume its hours.
+    client=load_client_config(EXAMPLE_CLIENT_CONFIG_PATH),
 )
 TIME_PLACEHOLDERS = ("{first_time}", "{second_time}", "{third_time}")
 # A bot text that promises the team will answer a question (the fixed text says it this way).

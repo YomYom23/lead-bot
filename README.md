@@ -58,6 +58,7 @@ uv sync
 #   WRITER_MODEL=gpt-6-luna                  # optional, this is the default
 #   BUSINESS_TIMEZONE=America/Phoenix        # optional, this is the default
 #   LEAD_BOT_DB_PATH=lead_bot.db             # optional, this is the default
+#   CLIENT_CONFIG_PATH=client.toml           # optional, this is the default
 #   GOOGLE_CALENDAR_ID=primary               # optional, this is the default
 #   TWILIO_ACCOUNT_SID=<starts with AC>      # all three Twilio values, or none (dry run)
 #   TWILIO_AUTH_TOKEN=<Console, Account info>
@@ -133,8 +134,9 @@ follow. `--only <category or name>` runs a subset.
 - Toll-free verification needs a real business (an EIN, or a sole proprietor), this opt-in
   page on a site it owns, and sample messages. Until it's approved, texts to US and Canadian
   numbers are blocked (Twilio error 30032).
-- The business facts the writer may use (`PLACEHOLDER_BUSINESS_FACTS` in `text_script.py`)
-  and the inspection hours in `settings.py` are placeholders. Replace them with the
-  roofer's own.
+- The business facts the writer may use and the inspection hours come from `client.toml`
+  (git-ignored; copy `client.example.toml`, whose values are placeholders). Fill it in with the
+  roofer's own. `CLIENT_CONFIG_PATH` points elsewhere if needed. Tests, scenarios and the
+  simulator always use `client.example.toml`.
 - The bot never discusses insurance coverage: in roofing that can count as unlicensed public
   adjusting.

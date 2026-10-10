@@ -1,0 +1,23 @@
+# One roofer's settings. Copy this file to client.toml and fill it in with the client's own
+# answers. client.example.toml is the placeholder roofer that tests, scenarios and the simulator
+# use; client.toml is git-ignored because each client's copy differs.
+# The business name, timezone and phone numbers live in .env, not here.
+
+[business]
+# Sentences the writer may text to a homeowner, beyond what the bot works out itself (hours,
+# address, booking). Only put in what the business has approved: each one can be sent as is.
+facts = [
+    "The inspection is free, and agreeing to it doesn't commit the homeowner to buying anything.",
+    "The inspector documents what they find on the roof.",
+    "After the inspection the homeowner gets a written estimate for any work that's needed.",
+    "The company does roof repairs and roof replacements for homes.",
+]
+
+[inspection]
+open_weekdays = [0, 1, 2, 3, 4]       # Monday is 0, Sunday is 6
+opening_time = 08:00:00               # no quotes: TOML reads this as a time
+closing_time = 17:00:00
+appointment_minutes = 60
+gap_after_appointment_minutes = 30    # kept free after each inspection to drive to the next job
+minimum_notice_minutes = 120          # nothing is booked sooner than this from now
+days_ahead = 14

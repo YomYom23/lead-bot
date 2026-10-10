@@ -12,6 +12,7 @@ from test_booking import FakeCalendar
 from typesafe_sdk import ChoiceAnswer, NoulAnswer
 
 from lead_bot.booking import CalendarBooking
+from lead_bot.client_config import EXAMPLE_CLIENT_CONFIG_PATH, load_client_config
 from lead_bot.conversation import ConversationServices
 from lead_bot.jev import Answer, JevError
 from lead_bot.settings import BusinessSettings
@@ -19,7 +20,12 @@ from lead_bot.store import Store
 from lead_bot.worker import SendRefused, Worker
 from lead_bot.writer import Turn, Writer, WriterError
 
-SETTINGS = BusinessSettings(business_name=BUSINESS_NAME, timezone=PHOENIX, texting_hours=HOURS)
+SETTINGS = BusinessSettings(
+    business_name=BUSINESS_NAME,
+    timezone=PHOENIX,
+    texting_hours=HOURS,
+    client=load_client_config(EXAMPLE_CLIENT_CONFIG_PATH),
+)
 
 # Put in a script where the homeowner picks a time: replaced by the first time actually offered.
 FIRST_OFFERED_TIME = "<first offered time>"

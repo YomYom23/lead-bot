@@ -8,6 +8,7 @@ import pytest
 from conftest import BUSINESS_NAME, DANA_PHONE, MONDAY_10AM, PHOENIX, phoenix
 from fastapi.testclient import TestClient
 
+from lead_bot.client_config import EXAMPLE_CLIENT_CONFIG_PATH, load_client_config
 from lead_bot.consent import CONSENT_VERSION
 from lead_bot.server import create_app
 from lead_bot.settings import BusinessSettings
@@ -15,7 +16,10 @@ from lead_bot.store import Store
 from lead_bot.timing import TextingHours
 
 SETTINGS = BusinessSettings(
-    business_name=BUSINESS_NAME, timezone=PHOENIX, texting_hours=TextingHours(PHOENIX)
+    business_name=BUSINESS_NAME,
+    timezone=PHOENIX,
+    texting_hours=TextingHours(PHOENIX),
+    client=load_client_config(EXAMPLE_CLIENT_CONFIG_PATH),
 )
 
 GOOD_FORM = {

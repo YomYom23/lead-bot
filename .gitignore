@@ -14,3 +14,5 @@ __pycache__/
 # Google OAuth: the client file downloaded from Cloud Console, and the token saved after login.
 client_secret*.json
 google_token.json
+# Each client's own facts and hours; client.example.toml is the tracked template.
+client.toml
