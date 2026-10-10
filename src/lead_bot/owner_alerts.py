@@ -190,6 +190,19 @@ ALERT_MEANINGS: dict[str, AlertMeaning] = {
     "homeowner_texted_after_handoff": AlertMeaning(
         "The homeowner texted after the bot handed them to you", "Read it below and reply to them."
     ),
+    "caller_left_a_message": AlertMeaning(
+        "A caller left a message with the phone assistant",
+        "Call them back. Their message is below.",
+        text_owner=True,
+    ),
+    "caller_hung_up": AlertMeaning(
+        "A caller hung up before booking",
+        "Call them back: they rang the business and nobody could answer. The call is below.",
+    ),
+    "abusive_caller": AlertMeaning(
+        "A caller was abusive, so the phone assistant ended the call",
+        "Decide whether to contact them. The call is below.",
+    ),
 }
 
 QUESTION_FOR_TEAM_PREFIX = "homeowner_question_for_the_team:"
@@ -235,7 +248,8 @@ def build_alert_email(
 ) -> EmailMessage:
     meaning = alert_meaning(alert.reason)
     lead = alert.lead
-    who = f"{lead.full_name}, {lead.address}" if lead is not None else (alert.text_phone or "unknown number")
+    caller = alert.text_phone or alert.call_phone
+    who = f"{lead.full_name}, {lead.address}" if lead is not None else (caller or "unknown number")
     subject = f"[{settings.business_name}] {'URGENT: ' if meaning.urgent else ''}{meaning.headline} - {who}"
     raised_at = alert.created_at.astimezone(settings.timezone)
 
@@ -248,12 +262,14 @@ def build_alert_email(
     if lead is not None:
         # The leads table stores the form's problem as text, so it's looked up as plain text.
         problem_labels: dict[str, str] = {str(problem): label for problem, label in PROBLEM_LABELS.items()}
-        # An old lead from a reactivation list filled in no form; say where it came from instead.
-        origin = (
-            f"From the reactivation list: {lead.campaign}"
-            if lead.campaign is not None
-            else f"On the form: {problem_labels.get(lead.problem, lead.problem)}"
-        )
+        # An old lead from a reactivation list, or a caller, filled in no form; say where it
+        # came from instead.
+        if lead.campaign is not None:
+            origin = f"From the reactivation list: {lead.campaign}"
+        elif lead.intake == "phone_call":
+            origin = "Came in as a phone call the office missed"
+        else:
+            origin = f"On the form: {problem_labels.get(lead.problem, lead.problem)}"
         lines += [
             f"Name: {lead.full_name}",
             f"Phone: {pretty_phone(lead.phone)}",
@@ -267,11 +283,18 @@ def build_alert_email(
                 for question, answer in lead.answers.items()
             )
             lines.append(f"Answers: {answers}")
-    elif alert.text_phone is not None:
-        phone = alert.text_phone
-        lines.append(f"From: {pretty_phone(phone) if phone.startswith('+1') else phone}")
+    elif caller is not None:
+        lines.append(f"From: {pretty_phone(caller) if caller.startswith('+1') else caller}")
     if alert.text_body is not None:
         lines += ["", "Their text:", f"  {alert.text_body}"]
+    if alert.call_message is not None:
+        lines += ["", "Their message:", f"  {alert.call_message}"]
+    if alert.call_transcript:
+        lines += ["", "The call:"]
+        for turn in alert.call_transcript:
+            # System notes (a hang-up, a draft that wasn't spoken) are marked, not quoted.
+            speaker = {"caller": "Caller", "bot": "Bot"}.get(turn.speaker)
+            lines.append(f"  {speaker}: {turn.text}" if speaker else f"  [{turn.text}]")
     if lead is not None and lead.transcript:
         lines += ["", "The whole conversation:"]
         for text in lead.transcript:
@@ -303,8 +326,13 @@ def build_alert_text(alert: AlertForText) -> str:
     details: list[str] = []
     if alert.full_name is not None and alert.phone is not None:
         details.append(f"{alert.full_name}, {pretty_phone(alert.phone)}, {alert.address}.")
+    elif alert.call_phone is not None:
+        caller = alert.call_phone
+        details.append(f"Caller {pretty_phone(caller) if caller.startswith('+1') else caller}.")
     if alert.booking is not None:
         details.append(f"Inspection: {alert.booking}.")
+    if alert.call_message is not None:
+        details.append(f'Message: "{alert.call_message}"')
     # A homeowner's name or address typed on a phone may hold curly quotes; one of them would
     # switch the whole text to the costlier encoding (see text_script.py).
     text = plain_punctuation(" ".join([headline, *details, meaning.action]))

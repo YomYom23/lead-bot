@@ -352,11 +352,14 @@ def off_topic_text(settings: BusinessSettings) -> str:
     )
 
 
-def conversation_facts(settings: BusinessSettings, address: str, booked_label: str | None) -> str:
+def conversation_facts(
+    settings: BusinessSettings, address: str, booked_label: str | None, on_a_call: bool = False
+) -> str:
     """Everything the writer is allowed to state in this conversation, one fact per line.
 
     The guard's unsupported_fact check compares each draft against exactly this text, so a
-    fact missing here gets the draft blocked rather than invented.
+    fact missing here gets the draft blocked rather than invented. `on_a_call`: the same facts
+    for a phone call (call_session.py), which says what the assistant is on the phone.
     """
     rules = settings.inspection_rules
     inspection_minutes = int(rules.appointment_length.total_seconds() // 60)
@@ -369,7 +372,10 @@ def conversation_facts(settings: BusinessSettings, address: str, booked_label: s
     return "\n".join(
         [
             f"Business name: {settings.business_name}.",
-            "This assistant is an artificial intelligence that texts for the business.",
+            "This assistant is an artificial intelligence that answers the business's phone, "
+            "and the call is transcribed."
+            if on_a_call
+            else "This assistant is an artificial intelligence that texts for the business.",
             f"The business's phone number: {pretty_phone(settings.callback_phone)}.",
             f"Inspections take about {inspection_minutes} minutes.",
             f"Inspections can be booked {inspection_days_text(rules)}, between "

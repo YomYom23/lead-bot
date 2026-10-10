@@ -45,12 +45,15 @@ MAX_TEXT_ATTEMPTS = 1 + len(REMINDER_DELAYS)
 
 # A conversation either follows up a form the homeowner just sent, or reactivates an old lead
 # from a client's list (reactivation.py). An old lead gets one reminder, two days later: they
-# didn't just ask, and three reminders to someone cold reads as spam and draws complaints.
-ConversationKind = Literal["form", "reactivation"]
+# didn't just ask, and three reminders to someone cold reads as spam and draws complaints. A
+# caller who booked on the phone and agreed to texts gets a text conversation too, but no
+# opening texts at all: it starts at 'booked', with the confirmation.
+ConversationKind = Literal["form", "reactivation", "call"]
 REACTIVATION_REMINDER_DELAYS = (timedelta(days=2),)
 REMINDER_DELAYS_BY_KIND: dict[ConversationKind, tuple[timedelta, ...]] = {
     "form": REMINDER_DELAYS,
     "reactivation": REACTIVATION_REMINDER_DELAYS,
+    "call": (),
 }
 
 

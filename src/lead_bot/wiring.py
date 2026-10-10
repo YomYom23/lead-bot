@@ -103,3 +103,42 @@ def build_conversation_services(settings: BusinessSettings) -> ConversationServi
         calendar_id=os.environ.get("GOOGLE_CALENDAR_ID", "").strip() or "primary",
     )
     return ConversationServices(ask_jev=build_jev().ask, booking=booking, writer=build_writer())
+
+
+# On a phone call every second of waiting is silence the caller hears, so calls get far tighter
+# limits than texts. A Jev failure is answered "Sorry, could you say that again?" and tried on
+# the caller's next words (call_session._after_jev_failure); a writer failure speaks the fixed
+# "I'll pass that to our team" line straight away.
+CALL_JEV_TIMEOUT_SECONDS = 2.5
+CALL_JEV_RETRIES = 1
+CALL_WRITER_TIMEOUT_SECONDS = 4.0
+
+
+class CallServicesLoader:
+    """Builds the services for phone calls the first time a call needs them, then reuses them.
+
+    Lazy so the web server starts without model keys (the form and texts don't need them in
+    this process), and a call arriving without them fails that call with a log line instead.
+    """
+
+    def __init__(self, settings: BusinessSettings) -> None:
+        self._settings = settings
+        self._lock = threading.Lock()  # two calls arriving at once build them once
+        self._services: ConversationServices | None = None
+
+    def __call__(self) -> ConversationServices:
+        with self._lock:
+            if self._services is None:
+                require_model_keys()
+                booking = GoogleBookingLoader(
+                    self._settings.inspection_rules,
+                    google_token_path_from_environment(),
+                    calendar_id=os.environ.get("GOOGLE_CALENDAR_ID", "").strip() or "primary",
+                )
+                writer = OpenAIWriter(
+                    model=os.environ.get("WRITER_MODEL", "").strip() or DEFAULT_WRITER_MODEL,
+                    timeout_seconds=CALL_WRITER_TIMEOUT_SECONDS,
+                )
+                jev = Jev(timeout_seconds=CALL_JEV_TIMEOUT_SECONDS, max_retries=CALL_JEV_RETRIES)
+                self._services = ConversationServices(ask_jev=jev.ask, booking=booking, writer=writer)
+            return self._services

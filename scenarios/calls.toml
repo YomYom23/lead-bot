@@ -1,0 +1,251 @@
+# lead-bot/scenarios/calls.toml
+# Scripted phone calls for the call scenario runner: uv run python -m lead_bot.call_scenarios
+#
+# Each [[call]] is one call the office missed, answered by the bot. The bot's greeting asks what
+# it can do for them, so `words` starts with the answer to that. Each line is one thing the
+# caller says, as Twilio's speech-to-text would hand it over. A script that runs out before the
+# call ends is the caller hanging up.
+#
+#   caller          new (default), known (the number on Dana Ruiz's earlier form, 12 Saguaro Ln),
+#                   known_booked (the same, already booked), hidden ('anonymous'), do_not_call
+#   result          how the call ended (calls.result). A list means any of them.
+#   answers         answers that must have been saved on the lead
+#   alerts_include  owner alerts that must exist (matched by prefix)
+#   never_say       regular expressions no bot line may match, case-insensitive
+#   texted          true/false: whether a booking confirmation text must be queued
+#   needs_real_jev  true when only a real model can follow the wording; --offline skips it
+#   note            why the call exists, shown in the report
+#
+# Checked on every call, whatever it says: "booked" means a booking exists; a text is queued only
+# for a caller who agreed to texts, and never for a hidden or do-not-call number; every call that
+# didn't opt out ends with an owner alert; nothing is said after the call ends; every "I'll pass
+# that to our team" has an owner alert.
+
+# ---------------------------------------------------------------------------------------------
+# Booking
+# ---------------------------------------------------------------------------------------------
+
+[[call]]
+name = "new_caller_books_and_gets_a_text"
+category = "booking"
+words = ["I've got hail damage on my roof", "My name is Pat Moreno", "It's 8 Mesquite Road, Tempe",
+         "Yes", "No", "No", "Yes, it's my house", "The first one", "Yes please", "No thanks"]
+result = "booked"
+answers = { address_confirmed = "yes", active_leak = "no", homeowner = "yes" }
+texted = true
+
+[[call]]
+name = "new_caller_books_without_a_text"
+category = "booking"
+words = ["I need a roof inspection", "Pat", "8 Mesquite Road", "yes", "no", "no", "yes", "the first one",
+         "No thanks", "nope"]
+result = "booked"
+texted = false
+
+[[call]]
+name = "hidden_number_books"
+category = "booking"
+caller = "hidden"
+words = ["roof repair please", "Pat", "8 Mesquite Road", "yes", "no", "no", "yes", "the first one", "no"]
+result = "booked"
+texted = false
+never_say = ["text the booking"]
+note = "A hidden number can't be texted, so the bot never offers to."
+
+[[call]]
+name = "do_not_call_caller_books"
+category = "booking"
+caller = "do_not_call"
+words = ["roof inspection", "Pat", "8 Mesquite Road", "yes", "no", "no", "yes", "the first one", "no"]
+result = "booked"
+texted = false
+never_say = ["text the booking"]
+note = "A number that opted out can still call and book; it's just never offered a text."
+
+[[call]]
+name = "active_leak_is_urgent"
+category = "booking"
+words = ["my roof is leaking", "Pat", "8 Mesquite Road", "yes", "Yes, it's dripping into the kitchen",
+         "probably", "yes", "the first one", "no", "no"]
+result = "booked"
+answers = { active_leak = "yes" }
+alerts_include = ["URGENT_active_leak", "inspection_booked"]
+
+[[call]]
+name = "address_misheard_twice"
+category = "booking"
+words = ["roof inspection", "Pat", "8 Mesquite", "No", "8 Mesquite Road", "No, that's still wrong",
+         "no", "no", "yes", "the first one", "no", "no"]
+result = "booked"
+answers = { address_confirmed = "no" }
+alerts_include = ["address_needs_correcting"]
+note = "After two misses the bot books anyway and tells the owner to confirm the address."
+
+[[call]]
+name = "renter_is_handed_off"
+category = "booking"
+words = ["roof leak", "Pat", "8 Mesquite Road", "yes", "no", "no", "No, I rent it"]
+result = "not_homeowner"
+alerts_include = ["not_the_homeowner"]
+
+[[call]]
+name = "no_offered_time_suits"
+category = "booking"
+words = ["roof inspection", "Pat", "8 Mesquite Road", "yes", "no", "no", "yes", "None of those work for me"]
+result = "no_time_suited"
+alerts_include = ["needs_a_different_inspection_time"]
+
+# ---------------------------------------------------------------------------------------------
+# Messages: callers who want something else
+# ---------------------------------------------------------------------------------------------
+
+[[call]]
+name = "invoice_question_leaves_a_message"
+category = "message"
+words = ["I'm calling about my invoice from last week", "Sam Lee"]
+result = "message"
+alerts_include = ["caller_left_a_message"]
+
+[[call]]
+name = "asks_for_a_real_person"
+category = "message"
+words = ["Can I talk to a real person?", "Sam"]
+result = "message"
+alerts_include = ["caller_left_a_message"]
+note = "Nobody could pick up, which is why the bot answered: it takes a message for a call back."
+
+[[call]]
+name = "sales_call_leaves_a_message"
+category = "message"
+words = ["Hi, I'm with a marketing company and wanted to talk about getting you more customers", "Chris"]
+result = "message"
+alerts_include = ["caller_left_a_message"]
+
+# ---------------------------------------------------------------------------------------------
+# Callers already on file
+# ---------------------------------------------------------------------------------------------
+
+[[call]]
+name = "known_caller_books_on_their_lead"
+category = "known"
+caller = "known"
+words = ["I'd like my roof inspected", "This is Dana", "yes", "no", "no", "yes", "the first one", "no"]
+result = "booked"
+texted = true
+never_say = ["Can I text"]
+note = "Her form consent already covers texts about the inspection, so she isn't asked again."
+
+[[call]]
+name = "known_number_different_name"
+category = "known"
+caller = "known"
+words = ["roof leak", "This is Jordan"]
+result = "hung_up"
+never_say = ["Saguaro"]
+note = "Someone else on that phone must not hear the address on file."
+
+[[call]]
+name = "known_caller_already_booked"
+category = "known"
+caller = "known_booked"
+words = ["calling about my inspection", "Dana", "Can we make it Thursday instead?"]
+result = "message"
+alerts_include = ["caller_left_a_message"]
+
+# ---------------------------------------------------------------------------------------------
+# Endings
+# ---------------------------------------------------------------------------------------------
+
+[[call]]
+name = "hangs_up_after_giving_a_name"
+category = "ending"
+words = ["my roof leaks", "Pat"]
+result = "hung_up"
+alerts_include = ["caller_hung_up"]
+texted = false
+
+[[call]]
+name = "hangs_up_during_the_greeting"
+category = "ending"
+words = []
+result = "hung_up"
+alerts_include = ["caller_hung_up"]
+note = "The owner still hears about a call that came in and hung up straight away."
+
+[[call]]
+name = "take_me_off_your_list"
+category = "ending"
+words = ["Please take me off your list"]
+result = "opted_out"
+
+[[call]]
+name = "abusive_caller"
+category = "ending"
+words = ["You're an idiot"]
+result = "abusive"
+alerts_include = ["abusive_caller"]
+
+# ---------------------------------------------------------------------------------------------
+# Off-script questions
+# ---------------------------------------------------------------------------------------------
+
+[[call]]
+name = "price_question_then_books"
+category = "off_script"
+words = ["roof repair", "How much does it cost?", "Pat", "8 Mesquite Road", "yes", "no", "no", "yes",
+         "the first one", "no", "no"]
+result = "booked"
+never_say = ['\$\s*\d']
+
+[[call]]
+name = "insurance_question"
+category = "off_script"
+words = ["roof inspection", "Will my insurance cover this?"]
+result = "hung_up"
+never_say = ["(will|should|would) (probably )?cover"]
+
+[[call]]
+name = "question_for_the_team"
+category = "off_script"
+words = ["roof inspection", "Do you also put in solar panels?"]
+result = "hung_up"
+alerts_include = ["homeowner_question_for_the_team"]
+
+[[call]]
+name = "not_understood_twice"
+category = "off_script"
+words = ["roof inspection", "Pat", "8 Mesquite Road", "banana", "pineapple"]
+result = "not_understood"
+alerts_include = ["bot_could_not_understand"]
+
+# ---------------------------------------------------------------------------------------------
+# Wording only a real model can follow
+# ---------------------------------------------------------------------------------------------
+
+[[call]]
+name = "rambling_booking"
+category = "booking"
+needs_real_jev = true
+words = [
+  "Yeah hi, so after that big storm last week I think we lost a bunch of shingles off the back",
+  "Uh, it's Pat, Pat Moreno",
+  "We're at 8 Mesquite Road in Tempe, the one with the blue garage",
+  "Yep, that's it",
+  "No, it's dry inside, thank goodness",
+  "I don't think so, we'll probably just pay for it",
+  "Yeah, we've owned it about ten years",
+  "Let's do the Tuesday one",
+  "Sure, go ahead and text me",
+  "Nope, that's everything, thanks",
+]
+result = "booked"
+texted = true
+
+[[call]]
+name = "owner_callback_mid_booking"
+category = "message"
+needs_real_jev = true
+words = ["roof inspection", "Pat Moreno", "8 Mesquite Road", "yes",
+         "Actually, could you just have the owner give me a call back?"]
+result = "message"
+alerts_include = ["caller_left_a_message"]

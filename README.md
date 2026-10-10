@@ -61,6 +61,24 @@ uv run python -m lead_bot.reactivation status
 Read the consent wordings the dry run lists before importing for real: whether a wording covers
 automated texts from this business is for a person (ideally the client's lawyer) to judge.
 
+Missed calls (`call_session.py`, `relay.py`): the business's line forwards calls nobody picked up
+to the Twilio number, whose "A call comes in" webhook is `<PUBLIC_BASE_URL>/twilio/voice/incoming`
+(POST). The server records the call with a one-time token and connects it to the live WebSocket
+at `/calls/relay` through Twilio ConversationRelay, which does the speech in both directions. The
+bot says it's an automated assistant and that the call is transcribed, then either books an
+inspection (name, address read back, the usual questions, a time) or takes a message for a call
+back. A caller already on file hears their address only after their name matched. After booking,
+a new caller is asked whether they may be texted the details; a yes is stored as consent with the
+exact question. Every call ends with an owner alert and the transcript; a message or a booking is
+also texted to the owner with `OWNER_ALERT_PHONE`. Calls need the model keys in the server's
+`.env` too, and a Twilio account that isn't a trial (trials strip ConversationRelay).
+
+```bash
+uv run python -m lead_bot.simulate --call --offline           # you are the caller, in the terminal
+uv run python -m lead_bot.simulate --call --known --offline   # ... calling from a number on file
+uv run python -m lead_bot.call_scenarios --offline            # ~20 scripted calls; scenarios/call-report.md
+```
+
 Every bot text is fixed wording from `text_script.py`. Jev only classifies what the homeowner
 wrote. The writer (OpenAI) drafts an answer only to an off-script question, and the guard
 (Jev checks plus regex backstops) must pass the draft before it is sent; otherwise the

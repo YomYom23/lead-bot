@@ -1,17 +1,20 @@
 # lead-bot/src/lead_bot/server.py
-"""The web server: the roofing company's inspection-request form, Twilio's two webhooks, and a
-health check.
+"""The web server: the roofing company's inspection-request form, Twilio's webhooks, the live-call
+WebSocket, and a health check.
 
-  GET  /                -> the form
-  POST /leads           -> validate, record the lead and its consent evidence, schedule the first text
-  POST /twilio/incoming -> a homeowner's text, from Twilio: check the signature, save it
-  POST /twilio/status   -> Twilio's delivery report for one of our texts: check, save
-  GET  /health          -> counts of leads and texts by status
+  GET  /                      -> the form
+  POST /leads                 -> validate, record the lead and its consent evidence, schedule the first text
+  POST /twilio/incoming       -> a homeowner's text, from Twilio: check the signature, save it
+  POST /twilio/status         -> Twilio's delivery report for one of our texts: check, save
+  POST /twilio/voice/incoming -> a forwarded call nobody picked up: check, record it, answer with
+                                 TwiML that connects it to the relay
+  WS   /calls/relay           -> the live call itself (relay.py)
+  GET  /health                -> counts of leads and texts by status
 
-Nothing here sends a text or calls a model. The handlers record and return at once, because
-Twilio retries a webhook that's slow to answer. Sending and answering happen in the worker
-process (worker.py), which re-checks consent, the do-not-call list and texting hours right
-before it queues each text the bot starts.
+Nothing here sends a text. The text handlers record and return at once, because Twilio retries a
+webhook that's slow to answer. Sending and answering texts happen in the worker process
+(worker.py), which re-checks consent, the do-not-call list and texting hours right before it
+queues each text the bot starts. Calls are live, so the relay answers them in this process.
 """
 
 from __future__ import annotations
@@ -28,12 +31,15 @@ from fastapi.responses import HTMLResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData
 
+from .call_script import call_twiml
 from .consent import CONSENT_VERSION, ConsentEvidence, consent_text
+from .conversation import ConversationServices
 from .leads import PROBLEM_LABELS, InvalidLeadForm, parse_lead_form, pretty_phone
+from .relay import add_relay_route
 from .settings import BusinessSettings
 from .store import AddedLead, Store
 from .timing import clock_label, utc_now
-from .twilio_sms import INCOMING_PATH, STATUS_PATH, TwilioSettings, request_is_from_twilio
+from .twilio_sms import INCOMING_PATH, STATUS_PATH, VOICE_PATH, TwilioSettings, request_is_from_twilio
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +110,17 @@ def create_app(
     settings: BusinessSettings,
     clock: Callable[[], datetime] = utc_now,
     twilio: TwilioSettings | None = None,
+    call_services: Callable[[], ConversationServices] | None = None,
 ) -> FastAPI:
     """Build the app. Everything is passed in so tests can control it.
 
     Without Twilio settings the webhooks answer 503, so a misconfigured server is obvious in
-    Twilio's error log instead of silently dropping texts.
+    Twilio's error log instead of silently dropping texts. Without `call_services` the bot
+    doesn't answer calls at all: the voice webhook answers 503 and there's no relay.
     """
     app = FastAPI(title="lead-bot")
+    if call_services is not None:
+        add_relay_route(app, store, settings, call_services, clock)
 
     def page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
         content = PAGE_TEMPLATE.substitute(
@@ -252,6 +262,25 @@ def create_app(
             if error_code is not None:
                 logger.warning("text %s: %s, Twilio error %s", message_id, status, error_code)
         return twiml_response()
+
+    @app.post(VOICE_PATH)
+    async def incoming_call(request: Request) -> Response:
+        if call_services is None:
+            logger.error("a call came in, but this server isn't set up to answer calls")
+            return Response("calls aren't answered on this server", status_code=503)
+        checked = await checked_twilio_form(request, VOICE_PATH)
+        if isinstance(checked, Response):
+            return checked
+        call_sid = str(checked.get("CallSid") or "")
+        # For a forwarded call, From is normally the person who rang the business (carriers
+        # differ; check it on the first real call). A hidden number arrives as 'anonymous'.
+        caller = str(checked.get("From") or "") or "anonymous"
+        if not call_sid:
+            logger.warning("incoming call without CallSid ignored")
+            return Response(EMPTY_TWIML, media_type="text/xml")
+        incoming = await run_in_threadpool(store.start_incoming_call, call_sid, caller, clock())
+        logger.info("call %d ringing (%s)", incoming.call_id, call_sid)
+        return Response(call_twiml(settings, incoming.call_id, incoming.relay_token), media_type="text/xml")
 
     @app.get("/favicon.ico")
     def no_favicon() -> Response:

@@ -20,7 +20,9 @@ Times are stored as Unix seconds (UTC) and handed out as timezone-aware datetime
 
 from __future__ import annotations
 
+import hmac
 import json
+import secrets
 import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -152,7 +154,8 @@ CREATE TABLE IF NOT EXISTS owner_alerts (
     lead_id    INTEGER REFERENCES leads (lead_id),  -- NULL: about a number with no lead
     reason     TEXT NOT NULL,
     created_at REAL NOT NULL,
-    text_id    INTEGER REFERENCES texts (text_id)   -- the incoming text behind it, if one was
+    text_id    INTEGER REFERENCES texts (text_id),  -- the incoming text behind it, if one was
+    call_id    INTEGER REFERENCES calls (call_id)   -- the phone call behind it, if one was
 );
 
 -- Which owner alerts have been emailed (owner_alerts.py). Kept apart from owner_alerts so a
@@ -199,6 +202,31 @@ CREATE TABLE IF NOT EXISTS campaign_contacts (
     skipped     TEXT                        -- why it was never started, e.g. 'opted out since import'
 );
 CREATE INDEX IF NOT EXISTS campaign_contacts_waiting ON campaign_contacts (campaign_id, started_at);
+
+-- Phone calls the bot answered (call_session.py): the business's line forwards calls nobody
+-- picked up to the Twilio number, and the bot takes them. One row per call.
+CREATE TABLE IF NOT EXISTS calls (
+    call_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_sid    TEXT NOT NULL UNIQUE,       -- Twilio's CallSid; UNIQUE: a retried webhook is one call
+    phone       TEXT NOT NULL,              -- the caller as Twilio gives it ('anonymous' if hidden)
+    lead_id     INTEGER REFERENCES leads (lead_id),  -- the lead the call is about, once known
+    relay_token TEXT NOT NULL,              -- one-time secret the live connection must present
+    status      TEXT NOT NULL,              -- 'ringing' -> 'connected' -> 'ended'
+    result      TEXT,                       -- how the bot's part ended, e.g. 'booked', 'message'
+    message     TEXT,                       -- what a caller asked to be passed on, if anything
+    started_at  REAL NOT NULL,
+    ended_at    REAL
+);
+
+-- Everything said on a call, in order: the transcript the owner gets with the alert.
+CREATE TABLE IF NOT EXISTS call_turns (
+    turn_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_id INTEGER NOT NULL REFERENCES calls (call_id),
+    speaker TEXT NOT NULL,                  -- 'bot', 'caller' or 'system'
+    text    TEXT NOT NULL,
+    said_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS call_turns_by_call ON call_turns (call_id, turn_id);
 """
 
 # homeowner         -> a text the homeowner sent us
@@ -289,6 +317,44 @@ class _RollBackDryRun(Exception):
         self.result = result
 
 
+# The consent version stored when a caller agrees on the phone to a text with their booking.
+VERBAL_CONSENT_VERSION = "verbal-on-call"
+
+
+@dataclass(frozen=True)
+class IncomingCall:
+    """A call Twilio just told us about, before the live connection opens."""
+
+    call_id: int
+    relay_token: str  # the live connection must present this; see connect_call
+
+
+@dataclass(frozen=True)
+class KnownCaller:
+    """The most recent lead with the caller's number, for a caller who has been in touch before."""
+
+    lead_id: int
+    full_name: str
+    address: str
+    booked_label: str | None
+    texts_allowed: bool  # their consent covers texts and the number isn't on the do-not-call list
+
+
+@dataclass(frozen=True)
+class ConnectedCall:
+    call_id: int
+    call_sid: str
+    phone: str  # as Twilio gave it: E.164, or 'anonymous' for a hidden number
+    known: KnownCaller | None
+    on_do_not_call: bool
+
+
+@dataclass(frozen=True)
+class CallTurnLine:
+    speaker: str  # 'bot', 'caller' or 'system'
+    text: str
+
+
 @dataclass(frozen=True)
 class DueOpening:
     """An opening text whose time has come. The worker words it; queue_opening_text re-checks it."""
@@ -354,6 +420,11 @@ class AlertForEmail:
     lead: LeadSummary | None  # None for a text from a number the bot never texted
     text_phone: str | None  # the incoming text behind the alert, if there was one
     text_body: str | None
+    # The phone call behind the alert, if there was one: who called, what they asked to pass
+    # on, and everything said.
+    call_phone: str | None = None
+    call_message: str | None = None
+    call_transcript: tuple[CallTurnLine, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -367,6 +438,8 @@ class AlertForText:
     phone: str | None
     address: str | None
     booking: str | None  # the booked time's label, if there is one
+    call_phone: str | None = None  # a caller with no lead (they left a message)
+    call_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -380,6 +453,7 @@ class LeadSummary:
     booking: str | None
     transcript: list[TranscriptLine]
     campaign: str | None = None  # the reactivation campaign it came from; None for a form lead
+    intake: str = ""  # how it arrived: an IntakeDecision for a form, 'phone_call' for a caller
 
 
 class Store:
@@ -406,6 +480,11 @@ class Store:
             consent_columns = {row["name"] for row in connection.execute("PRAGMA table_info(consents)")}
             if "consented_at" not in consent_columns:
                 connection.execute("ALTER TABLE consents ADD COLUMN consented_at REAL")
+            if "call_id" not in alert_columns:
+                # Which call an alert came from, so its email carries the call's transcript.
+                connection.execute(
+                    "ALTER TABLE owner_alerts ADD COLUMN call_id INTEGER REFERENCES calls (call_id)"
+                )
         finally:
             connection.close()
 
@@ -641,6 +720,208 @@ class Store:
                     )
                 )
         return summaries
+
+    # ---- phone calls (call_session.py, relay.py, server.py) ----
+
+    def start_incoming_call(self, call_sid: str, phone: str, now: datetime) -> IncomingCall:
+        """Record a call Twilio is about to connect, with a fresh one-time token for the live
+        connection. Twilio may retry the webhook; the same CallSid gets the same call back."""
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO calls (call_sid, phone, relay_token, status, started_at) "
+                "VALUES (?, ?, ?, 'ringing', ?)",
+                (call_sid, phone, secrets.token_urlsafe(24), now.timestamp()),
+            )
+            row = connection.execute(
+                "SELECT call_id, relay_token FROM calls WHERE call_sid = ?", (call_sid,)
+            ).fetchone()
+        return IncomingCall(call_id=row["call_id"], relay_token=row["relay_token"])
+
+    def connect_call(
+        self, call_id: int, relay_token: str, now: datetime, call_sid: str | None = None
+    ) -> ConnectedCall | None:
+        """Let the live connection start, once, and only with the token this call was given.
+
+        None for a wrong token, a call that isn't ringing (already connected or ended), no such
+        call, or (when `call_sid` is given) a different Twilio call than the one recorded. The
+        WebSocket address is public, so without this anyone who found it could open a "call"
+        and talk to the bot, booking real inspections.
+        """
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT call_sid, phone, relay_token, status FROM calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            # compare_digest takes the same time however much of the token matches, so the
+            # token can't be guessed one character at a time from how fast refusals come back.
+            if (
+                row is None
+                or row["status"] != "ringing"
+                or not hmac.compare_digest(str(row["relay_token"]), relay_token)
+                or (call_sid is not None and call_sid != row["call_sid"])
+            ):
+                return None
+            connection.execute("UPDATE calls SET status = 'connected' WHERE call_id = ?", (call_id,))
+            on_do_not_call = _is_on_do_not_call(connection, row["phone"])
+            return ConnectedCall(
+                call_id=call_id,
+                call_sid=row["call_sid"],
+                phone=row["phone"],
+                known=_known_caller(connection, row["phone"], on_do_not_call),
+                on_do_not_call=on_do_not_call,
+            )
+
+    def add_call_turn(self, call_id: int, speaker: str, text: str, now: datetime) -> None:
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO call_turns (call_id, speaker, text, said_at) VALUES (?, ?, ?, ?)",
+                (call_id, speaker, text, now.timestamp()),
+            )
+
+    def call_transcript(self, call_id: int) -> list[CallTurnLine]:
+        with self._read() as connection:
+            return _call_transcript(connection, call_id)
+
+    def call_result(self, call_id: int) -> str | None:
+        with self._read() as connection:
+            row = connection.execute("SELECT result FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+        return None if row is None else row["result"]
+
+    def call_lead_id(self, call_id: int) -> int | None:
+        with self._read() as connection:
+            row = connection.execute("SELECT lead_id FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+        return None if row is None else row["lead_id"]
+
+    def link_call_to_lead(self, call_id: int, lead_id: int) -> None:
+        """A known caller, confirmed by name: the call's answers and booking go to their lead."""
+        with self._write_transaction() as connection:
+            connection.execute("UPDATE calls SET lead_id = ? WHERE call_id = ?", (lead_id, call_id))
+
+    def add_lead_from_call(
+        self, call_id: int, full_name: str, phone: str, address: str, now: datetime
+    ) -> int:
+        """A new caller with a roof to inspect becomes a lead, linked to the call. No consent row
+        yet: they've agreed to nothing about texts until they're asked (record_text_consent)."""
+        with self._write_transaction() as connection:
+            cursor = connection.execute(
+                "INSERT INTO leads (full_name, phone, address, problem, created_at, intake, status) "
+                "VALUES (?, ?, ?, 'not_sure', ?, 'phone_call', 'in_conversation')",
+                (full_name, phone, address, now.timestamp()),
+            )
+            lead_id = cursor.lastrowid
+            if lead_id is None:  # can't happen after an INSERT, but the type allows it
+                raise RuntimeError("SQLite returned no id for the new lead")
+            connection.execute("UPDATE calls SET lead_id = ? WHERE call_id = ?", (lead_id, call_id))
+            return lead_id
+
+    def save_answer(self, lead_id: int, question: str, answer: str, now: datetime) -> None:
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO lead_answers (lead_id, question, answer, recorded_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (lead_id, question) DO UPDATE SET answer = excluded.answer, "
+                "recorded_at = excluded.recorded_at",
+                (lead_id, question, answer, now.timestamp()),
+            )
+
+    def add_call_alert(self, call_id: int, reason: str, now: datetime) -> None:
+        """An owner alert raised during a call, about the call's lead if it has one yet."""
+        with self._write_transaction() as connection:
+            row = connection.execute("SELECT lead_id FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+            lead_id = None if row is None else row["lead_id"]
+            _add_owner_alert(connection, lead_id, reason, now, call_id=call_id)
+
+    def record_call_booking(
+        self, call_id: int, lead_id: int, starts_at: datetime, slot_label: str, now: datetime
+    ) -> None:
+        """The booking, the lead now booked, and the owner told, in one transaction. A text
+        conversation the lead already had stops its reminders and knows about the booking."""
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO bookings (lead_id, starts_at, slot_label, booked_at) "
+                "VALUES (?, ?, ?, ?)",
+                (lead_id, starts_at.timestamp(), slot_label, now.timestamp()),
+            )
+            connection.execute("UPDATE leads SET status = 'booked' WHERE lead_id = ?", (lead_id,))
+            connection.execute(
+                "UPDATE conversations SET stage = 'booked', offered_slots = '[]', "
+                "next_opening_due_at = NULL, result = 'booked', last_activity_at = ? WHERE lead_id = ?",
+                (now.timestamp(), lead_id),
+            )
+            _add_owner_alert(connection, lead_id, "inspection_booked", now, call_id=call_id)
+
+    def record_text_consent(
+        self, lead_id: int, call_sid: str, given: bool, question: str, now: datetime
+    ) -> None:
+        """What a new caller answered when asked on the phone whether they may be texted. Kept
+        like a form's consent: the exact question, the answer, when, and which call."""
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO consents (lead_id, given, version, text_shown, ip_address, "
+                "forwarded_for, user_agent, source, recorded_at) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                (
+                    lead_id,
+                    1 if given else 0,
+                    VERBAL_CONSENT_VERSION,
+                    question,
+                    "phone call",
+                    f"Twilio call {call_sid}",
+                    "spoken answer on a phone call",
+                    now.timestamp(),
+                ),
+            )
+
+    def queue_call_confirmation(self, lead_id: int, body: str, now: datetime) -> None:
+        """Text the booking confirmation after a call, and give the lead a text conversation
+        (at 'booked') so a reply to it is answered like any other. The caller must have agreed
+        to texts; the do-not-call list is checked again here and when it's sent."""
+        with self._write_transaction() as connection:
+            lead = connection.execute("SELECT phone FROM leads WHERE lead_id = ?", (lead_id,)).fetchone()
+            consent = connection.execute(
+                "SELECT given FROM consents WHERE lead_id = ?", (lead_id,)
+            ).fetchone()
+            if lead is None or consent is None or consent["given"] != 1 or _is_on_do_not_call(
+                connection, lead["phone"]
+            ):
+                return
+            connection.execute(
+                "INSERT OR IGNORE INTO conversations (lead_id, stage, last_activity_at, kind, result) "
+                "VALUES (?, 'booked', ?, 'call', 'booked')",
+                (lead_id, now.timestamp()),
+            )
+            _queue_text(connection, lead_id, lead["phone"], "reply", body, now)
+
+    def finish_call(
+        self,
+        call_id: int,
+        result: str,
+        now: datetime,
+        lead_status: LeadStatus | None = None,
+        alert: str | None = None,
+        message: str | None = None,
+    ) -> bool:
+        """Record how the call ended, once. False if it had already ended (a hang-up arriving
+        after the bot said goodbye, say), and then nothing changes."""
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT status, lead_id FROM calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if row is None or row["status"] == "ended":
+                return False
+            connection.execute(
+                "UPDATE calls SET status = 'ended', result = ?, ended_at = ?, message = COALESCE(?, message) "
+                "WHERE call_id = ?",
+                (result, now.timestamp(), message, call_id),
+            )
+            lead_id = row["lead_id"]
+            if lead_id is not None and lead_status is not None:
+                # A booked lead stays booked, and an opted-out one stays opted out.
+                connection.execute(
+                    "UPDATE leads SET status = ? WHERE lead_id = ? AND status IN ('in_conversation', "
+                    "'following_up', 'unreached', 'handed_off', 'campaign_waiting')",
+                    (lead_status, lead_id),
+                )
+            if alert is not None:
+                _add_owner_alert(connection, lead_id, alert, now, call_id=call_id)
+            return True
 
     # ---- opening texts and reminders ----
 
@@ -1188,11 +1469,13 @@ class Store:
         with self._read() as connection:
             rows = connection.execute(
                 "SELECT owner_alerts.alert_id, owner_alerts.lead_id, owner_alerts.reason, "
-                "owner_alerts.created_at, COALESCE(alert_emails.tries, 0) AS tries, "
-                "texts.phone AS text_phone, texts.body AS text_body "
+                "owner_alerts.created_at, owner_alerts.call_id, COALESCE(alert_emails.tries, 0) AS tries, "
+                "texts.phone AS text_phone, texts.body AS text_body, "
+                "calls.phone AS call_phone, calls.message AS call_message "
                 "FROM owner_alerts "
                 "LEFT JOIN alert_emails ON alert_emails.alert_id = owner_alerts.alert_id "
                 "LEFT JOIN texts ON texts.text_id = owner_alerts.text_id "
+                "LEFT JOIN calls ON calls.call_id = owner_alerts.call_id "
                 "WHERE alert_emails.sent_at IS NULL "
                 "AND (alert_emails.not_before IS NULL OR alert_emails.not_before <= ?) "
                 "ORDER BY owner_alerts.alert_id LIMIT ?",
@@ -1207,6 +1490,11 @@ class Store:
                     lead=None if row["lead_id"] is None else _lead_summary(connection, row["lead_id"]),
                     text_phone=row["text_phone"],
                     text_body=row["text_body"],
+                    call_phone=row["call_phone"],
+                    call_message=row["call_message"],
+                    call_transcript=()
+                    if row["call_id"] is None
+                    else tuple(_call_transcript(connection, row["call_id"])),
                 )
                 for row in rows
             ]
@@ -1245,11 +1533,13 @@ class Store:
         with self._read() as connection:
             rows = connection.execute(
                 "SELECT owner_alerts.alert_id, owner_alerts.reason, COALESCE(alert_texts.tries, 0) AS tries, "
-                "leads.full_name, leads.phone, leads.address, bookings.slot_label "
+                "leads.full_name, leads.phone, leads.address, bookings.slot_label, "
+                "calls.phone AS call_phone, calls.message AS call_message "
                 "FROM owner_alerts "
                 "LEFT JOIN alert_texts ON alert_texts.alert_id = owner_alerts.alert_id "
                 "LEFT JOIN leads ON leads.lead_id = owner_alerts.lead_id "
                 "LEFT JOIN bookings ON bookings.lead_id = owner_alerts.lead_id "
+                "LEFT JOIN calls ON calls.call_id = owner_alerts.call_id "
                 f"WHERE owner_alerts.reason IN ({placeholders}) "
                 "AND owner_alerts.created_at >= ? "
                 "AND alert_texts.sent_at IS NULL "
@@ -1267,6 +1557,8 @@ class Store:
                 phone=row["phone"],
                 address=row["address"],
                 booking=row["slot_label"],
+                call_phone=row["call_phone"],
+                call_message=row["call_message"],
             )
             for row in rows
         ]
@@ -1322,7 +1614,7 @@ class Store:
 def _lead_summary(connection: sqlite3.Connection, lead_id: int) -> LeadSummary | None:
     """What an alert email says about the lead: who, where, the answers and every text."""
     lead = connection.execute(
-        "SELECT full_name, phone, address, problem FROM leads WHERE lead_id = ?", (lead_id,)
+        "SELECT full_name, phone, address, problem, intake FROM leads WHERE lead_id = ?", (lead_id,)
     ).fetchone()
     if lead is None:
         return None
@@ -1351,6 +1643,7 @@ def _lead_summary(connection: sqlite3.Connection, lead_id: int) -> LeadSummary |
             TranscriptLine(row["direction"], row["kind"], row["body"], row["status"]) for row in texts
         ],
         campaign=None if campaign is None else str(campaign["name"]),
+        intake=lead["intake"],
     )
 
 
@@ -1390,10 +1683,11 @@ def _add_owner_alert(
     reason: str,
     now: datetime,
     text_id: int | None = None,
+    call_id: int | None = None,
 ) -> None:
     connection.execute(
-        "INSERT INTO owner_alerts (lead_id, reason, created_at, text_id) VALUES (?, ?, ?, ?)",
-        (lead_id, reason, now.timestamp(), text_id),
+        "INSERT INTO owner_alerts (lead_id, reason, created_at, text_id, call_id) VALUES (?, ?, ?, ?, ?)",
+        (lead_id, reason, now.timestamp(), text_id, call_id),
     )
 
 
@@ -1435,6 +1729,33 @@ def _add_to_do_not_call(connection: sqlite3.Connection, phone: str, source: str,
         "AND status IN ('following_up', 'in_conversation', 'unreached', 'handed_off', 'campaign_waiting')",
         (phone,),
     )
+
+
+def _known_caller(connection: sqlite3.Connection, phone: str, on_do_not_call: bool) -> KnownCaller | None:
+    """The most recent lead with this number, or None. 'duplicate' leads are copies of another."""
+    row = connection.execute(
+        "SELECT leads.lead_id, leads.full_name, leads.address, bookings.slot_label, consents.given "
+        "FROM leads LEFT JOIN bookings ON bookings.lead_id = leads.lead_id "
+        "LEFT JOIN consents ON consents.lead_id = leads.lead_id "
+        "WHERE leads.phone = ? AND leads.status != 'duplicate' ORDER BY leads.lead_id DESC LIMIT 1",
+        (phone,),
+    ).fetchone()
+    if row is None:
+        return None
+    return KnownCaller(
+        lead_id=row["lead_id"],
+        full_name=row["full_name"],
+        address=row["address"],
+        booked_label=row["slot_label"],
+        texts_allowed=row["given"] == 1 and not on_do_not_call,
+    )
+
+
+def _call_transcript(connection: sqlite3.Connection, call_id: int) -> list[CallTurnLine]:
+    rows = connection.execute(
+        "SELECT speaker, text FROM call_turns WHERE call_id = ? ORDER BY turn_id", (call_id,)
+    ).fetchall()
+    return [CallTurnLine(row["speaker"], row["text"]) for row in rows]
 
 
 def _has_active_lead(connection: sqlite3.Connection, phone: str, except_lead_id: int | None = None) -> bool:

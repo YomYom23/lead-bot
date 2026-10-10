@@ -35,6 +35,8 @@ TWILIO_VARIABLES = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUM
 # the signature check must use the same public URL Twilio used.
 INCOMING_PATH = "/twilio/incoming"
 STATUS_PATH = "/twilio/status"
+# "A call comes in" on the number: a call the business's line forwarded (call_session.py).
+VOICE_PATH = "/twilio/voice/incoming"
 
 # A send that hangs is given up after this long. The text is then marked 'unknown' (it may have
 # gone), so a long wait gains nothing.

@@ -6,6 +6,7 @@
 *.jsonl
 # Written by `python -m lead_bot.scenarios` on every run; regenerate it rather than track it.
 scenarios/report.md
+scenarios/call-report.md
 __pycache__/
 .idea/
 .mypy_cache/

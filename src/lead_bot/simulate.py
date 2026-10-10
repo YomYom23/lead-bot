@@ -1,19 +1,24 @@
 # lead-bot/src/lead_bot/simulate.py
-"""A phone in the terminal: you are the homeowner, texting the bot.
+"""A phone in the terminal: you are the homeowner, texting the bot, or calling the business.
 
-    uv run python -m lead_bot.simulate --offline     # keyword stand-ins, no keys needed
-    uv run python -m lead_bot.simulate               # real Jev and the real writer
+    uv run python -m lead_bot.simulate --offline          # texting, keyword stand-ins, no keys needed
+    uv run python -m lead_bot.simulate                    # texting, real Jev and the real writer
+    uv run python -m lead_bot.simulate --call --offline   # a call the office missed (call_session.py)
+    uv run python -m lead_bot.simulate --call --known     # ... from a number already on file
 
-It adds a consenting test lead, then runs the real worker (worker.py) against a fresh database:
-the first text, your replies, the reminders, the booking. What's real: the database, the
-worker's checks, the conversation logic, and (without --offline) Jev and the writer. What's not:
-Twilio (texts are printed, and what you type goes straight into the database the way phase 2's
-webhook will put it there), and the calendar, which is always in memory.
+Texting adds a consenting test lead, then runs the real worker (worker.py) against a fresh
+database: the first text, your replies, the reminders, the booking. What's real: the database,
+the worker's checks, the conversation logic, and (without --offline) Jev and the writer. What's
+not: Twilio (texts are printed, and what you type goes straight into the database the way the
+webhook puts it there), and the calendar, which is always in memory.
+
+--call runs the real CallSession: each line you type is what you say on the phone, as Twilio's
+speech-to-text would hand it over. The greeting Twilio speaks is printed first.
 
 Commands at the prompt:
-    /wait 2h       pretend that much time passes with no reply (2h, 30m, 1d), so reminders and
-                   the hand-off of quiet conversations can be seen
-    /state         show where the conversation is, the answers saved, and the owner alerts
+    /wait 2h       (texting) pretend that much time passes with no reply (2h, 30m, 1d)
+    /hangup        (call) hang up
+    /state         show where things are, the answers saved, and the owner alerts
     /quit          stop
 """
 
@@ -126,12 +131,17 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--offline", action="store_true", help="keyword stand-ins for Jev, and no writer")
+    parser.add_argument("--call", action="store_true", help="call the business instead of texting")
+    parser.add_argument("--known", action="store_true", help="with --call: from a number already on file")
     arguments = parser.parse_args()
     load_dotenv()
     settings = SIMULATED_SETTINGS
     # Start inside texting hours, so the first text goes at once even when run late at night.
     clock = SimulatedClock(next_allowed_time(utc_now(), settings.texting_hours))
     services, mode = build_services(arguments.offline, settings, clock)
+    if arguments.call:
+        simulate_call(settings, services, clock, mode, known=arguments.known)
+        return
     sender: Sender = TerminalSender(clock, settings)
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as work_directory:
@@ -177,6 +187,73 @@ def lead_phone(store: Store, lead_id: int) -> str:
     if conversation is None:
         raise SystemExit("[simulator] the test lead has no conversation")
     return conversation.phone
+
+
+# A caller nobody has heard from, for --call without --known.
+SIMULATED_NEW_CALLER = "+1" + "480" + "555" + "0166"
+
+
+def simulate_call(
+    settings: BusinessSettings, services: ConversationServices, clock: SimulatedClock, mode: str, known: bool
+) -> None:
+    from .call_session import CallSession, ContinueTurn, EndCall, Say
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as work_directory:
+        store = Store(Path(work_directory) / "simulated.db")
+        phone = SIMULATED_NEW_CALLER
+        if known:
+            # Dana filled in the form earlier; now she calls from the same number.
+            lead_id = add_simulated_lead(store, settings, clock())
+            phone = lead_phone(store, lead_id)
+        incoming = store.start_incoming_call("CA-simulated", phone, clock())
+        connected = store.connect_call(incoming.call_id, incoming.relay_token, clock())
+        if connected is None:
+            raise SystemExit("[simulator] the simulated call didn't connect")
+        session = CallSession(connected, settings, store, services, clock)
+        who = "Dana Ruiz, calling from the number on her form" if known else "a new caller"
+        print(f"[simulator] {mode}. You are {who}. /hangup, /state, /quit.")
+        print(f"\n  BOT: {store.call_transcript(incoming.call_id)[0].text}")
+
+        def show(actions: list[object]) -> bool:
+            """Print what the bot says; True when the call is over."""
+            for action in actions:
+                if isinstance(action, Say):
+                    print(f"  BOT: {action.text}")
+                elif isinstance(action, EndCall):
+                    print(f"  [call ended: {action.reason}]")
+                    return True
+            return False
+
+        while not session.ended:
+            try:
+                line = input("\nyou say> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                line = "/hangup"
+            if not line:
+                continue
+            if line in ("/hangup", "/quit"):
+                session.on_hangup()
+                print("  [you hung up]")
+                break
+            if line == "/state":
+                print_call_state(store, incoming.call_id)
+                continue
+            actions: list[object] = list(session.on_prompt(line))
+            while actions and isinstance(actions[-1], ContinueTurn):
+                show(actions)
+                actions = list(session.continue_turn())
+            if show(actions):
+                break
+        print_call_state(store, incoming.call_id)
+
+
+def print_call_state(store: Store, call_id: int) -> None:
+    lead_id = store.call_lead_id(call_id)
+    print(f"  call result: {store.call_result(call_id)}; lead: {lead_id}")
+    if lead_id is not None:
+        print(f"  answers: {store.lead_answers(lead_id)}; booking: {store.booking_label(lead_id)}")
+    print(f"  owner alerts: {[alert.reason for alert in store.owner_alerts()]}")
 
 
 if __name__ == "__main__":

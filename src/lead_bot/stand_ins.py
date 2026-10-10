@@ -51,6 +51,15 @@ class OfflineJev:
     @staticmethod
     def _pick(text: str, criteria: Mapping[str, str]) -> str:
         options = list(criteria)
+        # Phone call stages (call_questions.py). A name or an address is whatever was said,
+        # unless it's a question.
+        if "roof" in options:
+            roof_words = r"\b(roof|leak\w*|inspect\w*|repair|hail|storm|shingles?|estimate|quote|damage)\b"
+            return "roof" if re.search(roof_words, text) else "message"
+        if "gave_name" in options and not text.rstrip().endswith("?"):
+            return "gave_name"
+        if "gave_address" in options and not text.rstrip().endswith("?"):
+            return "gave_address"
         slot_ids = [option for option in options if option.startswith("slot-")]
         if slot_ids:
             # Each slot's description is "2) Tuesday October 6 at 8 AM": match the time itself.

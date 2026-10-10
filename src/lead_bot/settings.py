@@ -24,6 +24,10 @@ DEFAULT_TIMEZONE = "America/Phoenix"
 DEFAULT_PUBLIC_BASE_URL = "http://127.0.0.1:8000"
 
 
+# Where a call's live connection reaches us (relay.py), under PUBLIC_BASE_URL.
+RELAY_PATH = "/calls/relay"
+
+
 @dataclass(frozen=True)
 class BusinessSettings:
     # The REGISTERED business name. The consent wording authorizes this seller by name, the first
@@ -47,6 +51,14 @@ class BusinessSettings:
     def inspection_rules(self) -> BookingRules:
         # Built here rather than stored: the hours come from client.toml, the timezone from .env.
         return self.client.inspection_hours.booking_rules(self.timezone)
+
+    @property
+    def relay_url(self) -> str:
+        """The WebSocket address Twilio connects a live call to: PUBLIC_BASE_URL with wss:// (or
+        ws:// locally) in place of https:// (http://)."""
+        base = self.public_base_url.rstrip("/")
+        scheme, _, rest = base.partition("://")
+        return f"{'wss' if scheme == 'https' else 'ws'}://{rest}{RELAY_PATH}"
 
     @classmethod
     def from_environment(cls) -> BusinessSettings:

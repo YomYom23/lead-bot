@@ -66,6 +66,7 @@ def test_only_the_alerts_that_need_action_today_are_texted() -> None:
         "URGENT_active_leak",
         "asked_for_a_person",
         "calendar_unavailable",
+        "caller_left_a_message",
         "google_sign_in_expired",
         "inspection_booked",
         "wants_to_change_booking",
