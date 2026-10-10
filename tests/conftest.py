@@ -16,6 +16,9 @@ from lead_bot.timing import TextingHours
 PHOENIX = ZoneInfo("America/Phoenix")
 HOURS = TextingHours(PHOENIX)
 BUSINESS_NAME = "Desert Ridge Roofing LLC"
+# The owner's mobile for alert texts (OWNER_ALERT_PHONE). 555-01xx numbers are reserved for
+# fiction, so no real phone is ever in a test.
+OWNER_PHONE = "+1" + "480" + "555" + "0177"
 DANA_PHONE = "+16025550142"
 
 

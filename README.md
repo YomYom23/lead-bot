@@ -37,6 +37,12 @@ answers and the whole conversation. Urgent ones say URGENT in the subject. A fai
 retried, never dropped. `worker --send` won't start without alert email, because the bot tells
 homeowners things like "I'll flag this as urgent for our team".
 
+With `OWNER_ALERT_PHONE` set, the alerts that need action today are also texted to the owner:
+water coming in, a homeowner asking for a person or to move their booking, every new booking,
+and the calendar failing. Only alerts under two hours old are texted, and a text that was
+refused or may have gone is never resent; the email carries every alert either way. The owner
+texting back ("ok, calling her") is ignored, not turned into a new alert.
+
 Every bot text is fixed wording from `text_script.py`. Jev only classifies what the homeowner
 wrote. The writer (OpenAI) drafts an answer only to an off-script question, and the guard
 (Jev checks plus regex backstops) must pass the draft before it is sent; otherwise the
@@ -67,6 +73,7 @@ uv sync
 #   OWNER_ALERT_EMAIL=<where owner alerts go>            # all three alert values, or none
 #   SMTP_USERNAME=<the Gmail address that sends them>
 #   SMTP_PASSWORD=<a Gmail app password, not the account password>
+#   OWNER_ALERT_PHONE=<the owner's mobile>   # optional: urgent alerts also by text
 uv run fastapi dev src/lead_bot/main.py      # the form at http://127.0.0.1:8000/
 uv run python -m lead_bot.worker             # second terminal; dry run, texts are printed
 uv run python -m lead_bot.worker --send      # or: real texts through Twilio

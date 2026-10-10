@@ -432,6 +432,8 @@ class Conversation:
         self._outcome.result = "booked"
         self._outcome.lead_status = "booked"
         self._outcome.unclear_in_a_row = 0
+        # Not a problem, but the owner wants to know the moment a job lands on their calendar.
+        self._outcome.owner_alerts.append("inspection_booked")
         self._reply(booked_text(result.slot_label, self._state.address))
 
     def _event_description(self) -> str:

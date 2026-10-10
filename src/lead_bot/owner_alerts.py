@@ -1,5 +1,6 @@
 # lead-bot/src/lead_bot/owner_alerts.py
-"""Emails the business owner about every owner alert the bot raises.
+"""Tells the business owner about every owner alert the bot raises: by email, and by text for
+the ones that need action today.
 
 The bot raises an alert whenever a person has to act: an active leak, a homeowner who asked for
 a person, a question the bot couldn't answer, a text that wasn't delivered. Until now those were
@@ -14,11 +15,18 @@ email per alert, and records each one sent (store.alert_emails). A failed email 
 later with growing gaps and never dropped. A crash between sending and recording means that
 email goes twice, which is better than an urgent alert lost.
 
+Texts to the owner (store.alert_texts) are an extra, not a replacement: only the alerts marked
+text_owner below are texted, only within ALERT_TEXT_MAX_AGE of being raised, and a text that
+was refused or may have gone is never retried. The email carries the alert either way. Roofers
+are on roofs, not in their inbox, so a leak or a homeowner asking for a call reaches them as a
+text.
+
 Settings (.env, all three or none):
     OWNER_ALERT_EMAIL   where alerts go
     SMTP_USERNAME       the account that sends them, e.g. a Gmail address
     SMTP_PASSWORD       for Gmail, an app password (needs 2-Step Verification), not the login
     SMTP_HOST, SMTP_PORT  optional: smtp.gmail.com and 587 (STARTTLS) by default
+    OWNER_ALERT_PHONE   optional: the owner's mobile, for alerts that need action today
 """
 
 from __future__ import annotations
@@ -40,8 +48,10 @@ from dotenv import load_dotenv
 
 from .leads import PROBLEM_LABELS, pretty_phone
 from .settings import BusinessSettings, database_path_from_environment
-from .store import AlertForEmail, Store
+from .store import AlertForEmail, AlertForText, Store
+from .text_script import plain_punctuation
 from .timing import clock_label, utc_now
+from .worker import Sender, SenderCredentialsRejected, SendRefused
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +64,12 @@ CHECK_EVERY_SECONDS = 15.0
 # The gap before trying a failed email again, by how many times it has failed. After the last,
 # it keeps trying hourly: an alert is never dropped.
 RETRY_GAPS = (timedelta(minutes=1), timedelta(minutes=5), timedelta(minutes=30), timedelta(hours=1))
+# An alert older than this is not texted, only emailed. A text about a leak from yesterday helps
+# nobody, and without a limit the first start with OWNER_ALERT_PHONE set would text the owner
+# every old urgent alert in the database at once.
+ALERT_TEXT_MAX_AGE = timedelta(hours=2)
+# Two GSM-7 segments. A longer alert text drops "what to do" and points to the email instead.
+MAX_ALERT_TEXT_CHARACTERS = 306
 
 
 # ---- what each alert means ----
@@ -64,6 +80,9 @@ class AlertMeaning:
     headline: str  # what happened, for the subject line and the first line
     action: str  # what the owner should do
     urgent: bool = False
+    # Also texted to the owner's phone (OWNER_ALERT_PHONE), not just emailed. Only for alerts
+    # that need action today, so the owner doesn't learn to ignore the texts.
+    text_owner: bool = False
 
 
 # Every alert reason the bot raises, in plain words. tests/test_owner_alerts.py checks that each
@@ -73,13 +92,16 @@ ALERT_MEANINGS: dict[str, AlertMeaning] = {
         "Water is coming into the house right now",
         "Call them as soon as you can. The bot told them it flagged this as urgent.",
         urgent=True,
+        text_owner=True,
     ),
     "address_needs_correcting": AlertMeaning(
         "The homeowner says the address on the form is wrong",
         "Get the right address before the inspection. The bot carried on with the other questions.",
     ),
     "asked_for_a_person": AlertMeaning(
-        "The homeowner asked to talk to a person", "Contact them. The bot has stopped texting them."
+        "The homeowner asked to talk to a person",
+        "Contact them. The bot has stopped texting them.",
+        text_owner=True,
     ),
     "abusive_texts": AlertMeaning(
         "The homeowner sent abusive texts",
@@ -113,15 +135,22 @@ ALERT_MEANINGS: dict[str, AlertMeaning] = {
         "There were no open inspection times to offer", "Free up some times and contact the homeowner."
     ),
     "wants_to_change_booking": AlertMeaning(
-        "The homeowner wants to change their booked inspection", "Contact them to move it."
+        "The homeowner wants to change their booked inspection", "Contact them to move it.", text_owner=True
+    ),
+    "inspection_booked": AlertMeaning(
+        "A homeowner booked an inspection",
+        "Nothing to do: it's on the calendar. The details are below.",
+        text_owner=True,
     ),
     "google_sign_in_expired": AlertMeaning(
         "The bot couldn't book: its Google Calendar sign-in has expired",
         "Run `uv run python -m lead_bot.google_login` again, then contact this homeowner to book.",
+        text_owner=True,
     ),
     "calendar_unavailable": AlertMeaning(
         "The bot couldn't reach Google Calendar to book",
         "Contact the homeowner to book the inspection by hand.",
+        text_owner=True,
     ),
     "opted_out_after_booking": AlertMeaning(
         "The homeowner opted out of texts after booking",
@@ -165,6 +194,9 @@ ALERT_MEANINGS: dict[str, AlertMeaning] = {
 
 QUESTION_FOR_TEAM_PREFIX = "homeowner_question_for_the_team:"
 NOT_DELIVERED_PREFIX = "text_not_delivered:"
+
+# The alert reasons texted to the owner as well as emailed.
+TEXTED_ALERT_REASONS = tuple(reason for reason, meaning in ALERT_MEANINGS.items() if meaning.text_owner)
 
 
 def alert_meaning(reason: str) -> AlertMeaning:
@@ -252,6 +284,27 @@ def build_alert_email(
         message["X-Priority"] = "1"
     message.set_content("\n".join(lines))
     return message
+
+
+# ---- the text to the owner ----
+
+
+def build_alert_text(alert: AlertForText) -> str:
+    """The short text version of an alert: what happened, who, and what to do. The full details
+    (answers, the whole conversation) stay in the email."""
+    meaning = alert_meaning(alert.reason)
+    headline = f"Lead bot: {'URGENT: ' if meaning.urgent else ''}{meaning.headline}."
+    details: list[str] = []
+    if alert.full_name is not None and alert.phone is not None:
+        details.append(f"{alert.full_name}, {pretty_phone(alert.phone)}, {alert.address}.")
+    if alert.booking is not None:
+        details.append(f"Inspection: {alert.booking}.")
+    # A homeowner's name or address typed on a phone may hold curly quotes; one of them would
+    # switch the whole text to the costlier encoding (see text_script.py).
+    text = plain_punctuation(" ".join([headline, *details, meaning.action]))
+    if len(text) > MAX_ALERT_TEXT_CHARACTERS:
+        text = plain_punctuation(" ".join([headline, *details, "Details are in your email."]))
+    return text[:MAX_ALERT_TEXT_CHARACTERS]
 
 
 # ---- sending ----
@@ -346,6 +399,16 @@ class PrintingMailer:
         print(f"\n[owner alert email, not sent] {message['Subject']}\n{message.get_content()}")
 
 
+@dataclass(frozen=True)
+class AlertTexter:
+    """Where alert texts go and what sends them. The sender is the notifier's own, not the
+    worker's: the notifier runs on another thread, and one Twilio client shouldn't be shared
+    between threads."""
+
+    sender: Sender
+    owner_phone: str  # E.164
+
+
 class OwnerAlertNotifier:
     def __init__(
         self,
@@ -356,6 +419,7 @@ class OwnerAlertNotifier:
         to_address: str,
         clock: Callable[[], datetime] = utc_now,
         record_sent: bool = True,
+        texter: AlertTexter | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -368,9 +432,19 @@ class OwnerAlertNotifier:
         # are remembered for this run only, so each is printed once.
         self._record_sent = record_sent
         self._printed: set[int] = set()
+        # None: no OWNER_ALERT_PHONE, so alerts are only emailed.
+        self._texter = texter
+        self._printed_texts: set[int] = set()
 
     def notify_pending(self) -> int:
-        """Email every alert that's due. Returns how many went."""
+        """Email every alert that's due, and text the owner the ones that need action today.
+        Returns how many emails and texts went."""
+        sent = self._email_pending()
+        if self._texter is not None:
+            sent += self._text_pending(self._texter)
+        return sent
+
+    def _email_pending(self) -> int:
         sent = 0
         for alert in self._store.alerts_to_email(self._clock(), limit=1000 if not self._record_sent else 10):
             if alert.alert_id in self._printed:
@@ -403,6 +477,42 @@ class OwnerAlertNotifier:
         gap = RETRY_GAPS[min(alert.tries, len(RETRY_GAPS) - 1)]
         self._store.retry_alert_email_later(alert.alert_id, error, self._clock() + gap)
 
+    def _text_pending(self, texter: AlertTexter) -> int:
+        """Text the owner each fresh alert that needs action today. Returns how many went."""
+        sent = 0
+        alerts = self._store.alerts_to_text(self._clock(), TEXTED_ALERT_REASONS, ALERT_TEXT_MAX_AGE)
+        for alert in alerts:
+            if alert.alert_id in self._printed_texts:
+                continue
+            try:
+                provider_message_id = texter.sender.send(texter.owner_phone, build_alert_text(alert))
+            except SenderCredentialsRejected as error:
+                # Every text would fail the same way: stop this pass and try again later. Unlike a
+                # refusal, this one is retried, since the text itself was never the problem.
+                logger.critical("Twilio refused the bot's credentials for an alert text: %s", error)
+                gap = RETRY_GAPS[min(alert.tries, len(RETRY_GAPS) - 1)]
+                retry_at = self._clock() + gap
+                self._store.retry_alert_text_later(alert.alert_id, f"credentials refused: {error}", retry_at)
+                break
+            except SendRefused as error:
+                logger.warning("alert %d text refused: %s", alert.alert_id, error)
+                self._store.give_up_alert_text(alert.alert_id, f"refused: {error}")
+                continue
+            except Exception as error:
+                # It may have gone (a timeout after the request left), so it's never resent: the
+                # owner getting the same alert twice would teach them to skim. The email has it.
+                logger.exception("alert %d text: send failed; it may or may not have gone", alert.alert_id)
+                error_note = f"may have gone: {type(error).__name__}: {error}"
+                self._store.give_up_alert_text(alert.alert_id, error_note)
+                continue
+            if self._record_sent:
+                self._store.mark_alert_texted(alert.alert_id, provider_message_id, self._clock())
+            else:
+                self._printed_texts.add(alert.alert_id)
+            logger.info("alert %d texted: %s", alert.alert_id, alert.reason)
+            sent += 1
+        return sent
+
     def run_forever(self, stop: threading.Event) -> None:
         """The notifier thread's loop. It must never die quietly, so every pass is guarded."""
         while not stop.is_set():
@@ -414,14 +524,17 @@ class OwnerAlertNotifier:
 
 
 def build_notifier(
-    store: Store, settings: BusinessSettings, email: EmailSettings | None
+    store: Store, settings: BusinessSettings, email: EmailSettings | None, texter: AlertTexter | None = None
 ) -> OwnerAlertNotifier:
-    """The notifier for these settings: real email when set, printed emails otherwise."""
+    """The notifier for these settings: real email when set, printed emails otherwise. `texter`
+    adds texts to the owner; a printing sender there prints them instead."""
     if email is None:
         return OwnerAlertNotifier(
-            store, settings, PrintingMailer(), "lead-bot", "the owner", record_sent=False
+            store, settings, PrintingMailer(), "lead-bot", "the owner", record_sent=False, texter=texter
         )
-    return OwnerAlertNotifier(store, settings, SmtpMailer(email), email.username, email.to_address)
+    return OwnerAlertNotifier(
+        store, settings, SmtpMailer(email), email.username, email.to_address, texter=texter
+    )
 
 
 def send_test_email(email: EmailSettings, settings: BusinessSettings, mailer: Mailer | None = None) -> None:

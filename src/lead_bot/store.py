@@ -152,6 +152,19 @@ CREATE TABLE IF NOT EXISTS alert_emails (
     not_before REAL,                        -- after a failure: not tried again before this
     last_error TEXT
 );
+
+-- Which owner alerts have been texted to the owner's phone (owner_alerts.py). Only alerts that
+-- need action today are texted, and only while fresh; email still carries every alert. Kept
+-- apart from alert_emails so each channel tracks its own sends and failures.
+CREATE TABLE IF NOT EXISTS alert_texts (
+    alert_id            INTEGER PRIMARY KEY REFERENCES owner_alerts (alert_id),
+    sent_at             REAL,                -- NULL until it has gone
+    provider_message_id TEXT,                -- Twilio's MessageSid for the text
+    tries               INTEGER NOT NULL DEFAULT 0,
+    not_before          REAL,                -- after a refused login: not tried again before this
+    gave_up             INTEGER NOT NULL DEFAULT 0,  -- 1: refused, or may have gone; never retried
+    last_error          TEXT
+);
 """
 
 # homeowner         -> a text the homeowner sent us
@@ -266,6 +279,19 @@ class AlertForEmail:
     lead: LeadSummary | None  # None for a text from a number the bot never texted
     text_phone: str | None  # the incoming text behind the alert, if there was one
     text_body: str | None
+
+
+@dataclass(frozen=True)
+class AlertForText:
+    """An owner alert to text the owner, with the few details that fit in a text."""
+
+    alert_id: int
+    reason: str
+    tries: int  # refused logins so far
+    full_name: str | None  # None for an alert with no lead
+    phone: str | None
+    address: str | None
+    booking: str | None  # the booked time's label, if there is one
 
 
 @dataclass(frozen=True)
@@ -985,6 +1011,78 @@ class Store:
             connection.execute(
                 "INSERT INTO alert_emails (alert_id, tries, not_before, last_error) VALUES (?, 1, ?, ?) "
                 "ON CONFLICT (alert_id) DO UPDATE SET tries = alert_emails.tries + 1, "
+                "not_before = excluded.not_before, last_error = excluded.last_error",
+                (alert_id, not_before.timestamp(), error[:500]),
+            )
+
+    # ---- owner alert texts (owner_alerts.py) ----
+
+    def alerts_to_text(
+        self, now: datetime, reasons: tuple[str, ...], max_age: timedelta, limit: int = 10
+    ) -> list[AlertForText]:
+        """Alerts with one of `reasons`, raised within `max_age`, not texted or given up on yet,
+        and past any retry time. Oldest first.
+
+        The age limit matters on the first start with texting turned on: without it, every old
+        urgent alert in the database would be texted to the owner at once.
+        """
+        if not reasons:
+            return []
+        placeholders = ", ".join("?" for _ in reasons)
+        with self._read() as connection:
+            rows = connection.execute(
+                "SELECT owner_alerts.alert_id, owner_alerts.reason, COALESCE(alert_texts.tries, 0) AS tries, "
+                "leads.full_name, leads.phone, leads.address, bookings.slot_label "
+                "FROM owner_alerts "
+                "LEFT JOIN alert_texts ON alert_texts.alert_id = owner_alerts.alert_id "
+                "LEFT JOIN leads ON leads.lead_id = owner_alerts.lead_id "
+                "LEFT JOIN bookings ON bookings.lead_id = owner_alerts.lead_id "
+                f"WHERE owner_alerts.reason IN ({placeholders}) "
+                "AND owner_alerts.created_at >= ? "
+                "AND alert_texts.sent_at IS NULL "
+                "AND COALESCE(alert_texts.gave_up, 0) = 0 "
+                "AND (alert_texts.not_before IS NULL OR alert_texts.not_before <= ?) "
+                "ORDER BY owner_alerts.alert_id LIMIT ?",
+                (*reasons, (now - max_age).timestamp(), now.timestamp(), limit),
+            ).fetchall()
+        return [
+            AlertForText(
+                alert_id=row["alert_id"],
+                reason=row["reason"],
+                tries=row["tries"],
+                full_name=row["full_name"],
+                phone=row["phone"],
+                address=row["address"],
+                booking=row["slot_label"],
+            )
+            for row in rows
+        ]
+
+    def mark_alert_texted(self, alert_id: int, provider_message_id: str, now: datetime) -> None:
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO alert_texts (alert_id, sent_at, provider_message_id) VALUES (?, ?, ?) "
+                "ON CONFLICT (alert_id) DO UPDATE SET sent_at = excluded.sent_at, "
+                "provider_message_id = excluded.provider_message_id, last_error = NULL",
+                (alert_id, now.timestamp(), provider_message_id),
+            )
+
+    def give_up_alert_text(self, alert_id: int, error: str) -> None:
+        """Never text this alert: the provider refused it, or it may have gone already (a resend
+        could reach the owner twice). The email still carries it."""
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO alert_texts (alert_id, tries, gave_up, last_error) VALUES (?, 1, 1, ?) "
+                "ON CONFLICT (alert_id) DO UPDATE SET tries = alert_texts.tries + 1, gave_up = 1, "
+                "last_error = excluded.last_error",
+                (alert_id, error[:500]),
+            )
+
+    def retry_alert_text_later(self, alert_id: int, error: str, not_before: datetime) -> None:
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO alert_texts (alert_id, tries, not_before, last_error) VALUES (?, 1, ?, ?) "
+                "ON CONFLICT (alert_id) DO UPDATE SET tries = alert_texts.tries + 1, "
                 "not_before = excluded.not_before, last_error = excluded.last_error",
                 (alert_id, not_before.timestamp(), error[:500]),
             )

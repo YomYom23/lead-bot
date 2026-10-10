@@ -39,6 +39,9 @@ class BusinessSettings:
     # E.164, like +14805550199.
     callback_phone: str = "+14805550199"
     public_base_url: str = DEFAULT_PUBLIC_BASE_URL
+    # The owner's mobile, E.164, for alerts that need action today (owner_alerts.py). None:
+    # alerts go by email only. Email always gets every alert; this only adds a text.
+    owner_alert_phone: str | None = None
 
     @property
     def inspection_rules(self) -> BookingRules:
@@ -71,6 +74,7 @@ class BusinessSettings:
         public_base_url = os.environ.get("PUBLIC_BASE_URL", DEFAULT_PUBLIC_BASE_URL).strip()
         if not public_base_url.startswith(("http://", "https://")):
             raise RuntimeError(f"PUBLIC_BASE_URL={public_base_url!r} must start with http:// or https://")
+        owner_alert_phone = _optional_phone("OWNER_ALERT_PHONE")
         # InvalidClientConfig is a RuntimeError, so a bad client.toml stops startup the same way
         # a bad .env value does, with a message naming the key.
         client = load_client_config(client_config_path_from_environment())
@@ -81,7 +85,20 @@ class BusinessSettings:
             client=client,
             callback_phone=callback_phone,
             public_base_url=public_base_url,
+            owner_alert_phone=owner_alert_phone,
         )
+
+
+def _optional_phone(variable: str) -> str | None:
+    """A US phone number from the environment, or None when it isn't set. A value that is set
+    but isn't a phone number stops startup: otherwise alerts would silently go nowhere."""
+    raw = os.environ.get(variable, "").strip()
+    if not raw:
+        return None
+    try:
+        return normalize_us_phone(raw)
+    except InvalidLeadForm:
+        raise RuntimeError(f"{variable} must be a 10-digit US mobile number, or left out") from None
 
 
 def database_path_from_environment() -> str:

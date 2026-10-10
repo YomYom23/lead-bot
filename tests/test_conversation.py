@@ -88,7 +88,8 @@ def test_four_answers_and_a_pick_book_the_inspection(store: Store) -> None:
     label = store.booking_label(lead_id)
     assert label is not None
     assert sender.bodies[-1].startswith(f"You're all set for {label}.")
-    assert alerts(store) == []
+    # The owner hears about the booking, and nothing else needs them.
+    assert alerts(store) == ["inspection_booked"]
 
 
 def test_a_bare_number_picks_that_time_without_asking_jev(store: Store) -> None:
@@ -314,7 +315,7 @@ def test_none_of_the_times_gets_the_hours_and_later_days_once(store: Store) -> N
     later_days = [label.rsplit(" at ", 1)[0] for label in offered_times(later_offer)]
     assert len(later_days) == 3 and not set(first_days) & set(later_days)
     assert store.booking_label(lead_id) == offered_times(later_offer)[0]
-    assert alerts(store) == []
+    assert alerts(store) == ["inspection_booked"]
 
 
 def test_turning_down_the_later_times_too_goes_to_a_person(store: Store) -> None:

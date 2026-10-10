@@ -193,6 +193,11 @@ class Worker:
             # Not a conversation the bot is running: never texted, opted out, or taken over by a
             # person. No scripted reply. An opt-out is still honored, and anything else is
             # passed to the owner, because only a person can tell what it's about.
+            # Except the owner's own replies to alert texts ("ok, calling her now"): passing those
+            # to the owner would email them about their own text, every time.
+            from_the_owner = (
+                incoming.conversation is None and incoming.phone == self._settings.owner_alert_phone
+            )
             if incoming.conversation is None:
                 reason = "text_from_a_number_without_a_conversation"
             elif incoming.on_do_not_call:
@@ -210,7 +215,7 @@ class Worker:
                 confirmation=confirmation
                 if incoming.conversation is not None and not incoming.on_do_not_call
                 else None,
-                alert=None if keyword is not None else reason,
+                alert=None if keyword is not None or from_the_owner else reason,
             )
             return True
 
@@ -348,7 +353,7 @@ def main() -> None:
 def _build_alert_notifier(
     send_for_real: bool, store: Store, settings: BusinessSettings
 ) -> OwnerAlertNotifier:
-    from .owner_alerts import EMAIL_VARIABLES, EmailSettings, build_notifier
+    from .owner_alerts import EMAIL_VARIABLES, AlertTexter, EmailSettings, build_notifier
 
     email = EmailSettings.from_environment()
     if email is None and send_for_real:
@@ -359,7 +364,24 @@ def _build_alert_notifier(
         print("[worker] owner alerts are printed, not emailed (no OWNER_ALERT_EMAIL in .env).")
     else:
         print(f"[worker] owner alerts are emailed to {email.to_address}.")
-    return build_notifier(store, settings, email)
+    texter = None
+    if settings.owner_alert_phone is not None:
+        texter = AlertTexter(_build_alert_sender(send_for_real), settings.owner_alert_phone)
+        print(f"[worker] alerts that need action today are also texted to {settings.owner_alert_phone}.")
+    return build_notifier(store, settings, email, texter)
+
+
+def _build_alert_sender(send_for_real: bool) -> Sender:
+    """The sender for alert texts to the owner: its own Twilio client, since it runs on the
+    notifier's thread. No delivery reports: they update homeowner texts, and this isn't one."""
+    if not send_for_real:
+        return PrintingSender()
+    from .twilio_sms import TwilioSender, TwilioSettings
+
+    twilio_settings = TwilioSettings.from_environment()
+    if twilio_settings is None:
+        raise SystemExit("[worker] OWNER_ALERT_PHONE with --send needs the three TWILIO_ values in .env")
+    return TwilioSender(twilio_settings, status_callback_url=None)
 
 
 def _build_sender(send_for_real: bool, settings: BusinessSettings) -> Sender:
