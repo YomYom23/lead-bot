@@ -79,6 +79,18 @@ uv run python -m lead_bot.simulate --call --known --offline   # ... calling from
 uv run python -m lead_bot.call_scenarios --offline            # ~20 scripted calls; scenarios/call-report.md
 ```
 
+Monthly report (`report.py`): on or after 8 AM on the 1st, the worker emails the owner last
+month's results: inspections booked and where they came from (web form, phone calls, old-lead
+campaigns), form leads texted, replied and booked, missed calls answered, campaign replies,
+urgent leaks, hand-offs, opt-outs, and the three most recent bookings. Months follow the
+business's timezone. Each month goes once (`monthly_reports`), and a new install sends nothing
+for the month before its first lead or call.
+
+```bash
+uv run python -m lead_bot.report                          # preview last month's report
+uv run python -m lead_bot.report --month 2026-10 --send   # email a month now
+```
+
 Every bot text is fixed wording from `text_script.py`. Jev only classifies what the homeowner
 wrote. The writer (OpenAI) drafts an answer only to an off-script question, and the guard
 (Jev checks plus regex backstops) must pass the draft before it is sent; otherwise the

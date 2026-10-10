@@ -227,6 +227,12 @@ CREATE TABLE IF NOT EXISTS call_turns (
     said_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS call_turns_by_call ON call_turns (call_id, turn_id);
+
+-- Which monthly results emails have gone (report.py), so each month's goes once.
+CREATE TABLE IF NOT EXISTS monthly_reports (
+    month   TEXT PRIMARY KEY,               -- 'YYYY-MM', the month the report covers
+    sent_at REAL NOT NULL
+);
 """
 
 # homeowner         -> a text the homeowner sent us
@@ -261,6 +267,13 @@ OpeningResult = Literal["queued", "rescheduled", "stopped", "not_due"]
 
 # A second form from a number in one of these gets no second conversation.
 ACTIVE_LEAD_STATUSES = ("following_up", "in_conversation", "booked")
+
+# Where a lead came from, as SQL over `leads` (the monthly report counts bookings by it): a
+# reactivation list, a phone call the office missed, or the web form.
+_LEAD_SOURCE = (
+    "CASE WHEN EXISTS (SELECT 1 FROM campaign_contacts WHERE campaign_contacts.lead_id = leads.lead_id) "
+    "THEN 'reactivation' WHEN leads.intake = 'phone_call' THEN 'phone' ELSE 'form' END"
+)
 
 LEAD_STATUS_FOR_INTAKE: dict[IntakeDecision, LeadStatus] = {
     "text": "following_up",
@@ -353,6 +366,36 @@ class ConnectedCall:
 class CallTurnLine:
     speaker: str  # 'bot', 'caller' or 'system'
     text: str
+
+
+@dataclass(frozen=True)
+class BookedInspection:
+    full_name: str
+    slot_label: str
+    source: str  # 'form', 'phone' or 'reactivation'
+
+
+@dataclass(frozen=True)
+class MonthlyNumbers:
+    """What the bot did in one month, for the owner's monthly email (report.py)."""
+
+    form_leads: int  # leads from the web form
+    form_leads_texted: int  # of those, the ones with consent the bot texted
+    form_leads_replied: int  # of those texted, the ones who replied
+    form_leads_booked: int
+    bookings: int  # every inspection booked this month, whatever the source
+    bookings_by_source: dict[str, int]  # 'form', 'phone', 'reactivation' -> how many
+    calls_answered: int
+    calls_booked: int
+    calls_messages: int  # callers who left a message for a call back
+    calls_hung_up: int
+    reactivation_started: int  # old leads texted for the first time this month
+    reactivation_replied: int
+    reactivation_booked: int
+    urgent_leaks: int
+    alerts_for_owner: int  # alerts that needed a person, not counting "inspection booked"
+    opted_out: int  # numbers added to the do-not-call list
+    recent_bookings: list[BookedInspection]  # up to three, most recent first
 
 
 @dataclass(frozen=True)
@@ -1590,6 +1633,94 @@ class Store:
                 "ON CONFLICT (alert_id) DO UPDATE SET tries = alert_texts.tries + 1, "
                 "not_before = excluded.not_before, last_error = excluded.last_error",
                 (alert_id, not_before.timestamp(), error[:500]),
+            )
+
+    # ---- the monthly report (report.py) ----
+
+    def monthly_numbers(self, start: datetime, end: datetime) -> MonthlyNumbers:
+        """Everything counted for [start, end): leads by when they arrived, bookings by when
+        they were made, calls by when they came in, campaign contacts by when they were first
+        texted, alerts and opt-outs by when they happened."""
+        window = (start.timestamp(), end.timestamp())
+        with self._read() as connection:
+
+            def count(sql: str, parameters: tuple[object, ...] = window) -> int:
+                return int(connection.execute(sql, parameters).fetchone()[0])
+
+            form_lead = (
+                "leads.intake != 'phone_call' AND NOT EXISTS (SELECT 1 FROM campaign_contacts "
+                "WHERE campaign_contacts.lead_id = leads.lead_id)"
+            )
+            replied = (
+                "EXISTS (SELECT 1 FROM texts WHERE texts.lead_id = leads.lead_id AND texts.direction = 'in')"
+            )
+            booked = "EXISTS (SELECT 1 FROM bookings WHERE bookings.lead_id = leads.lead_id)"
+            form_leads_in_window = (
+                "SELECT COUNT(*) FROM leads WHERE leads.created_at >= ? AND leads.created_at < ? "
+                f"AND {form_lead}"
+            )
+            calls_in_window = "SELECT COUNT(*) FROM calls WHERE started_at >= ? AND started_at < ?"
+            alerts_in_window = "SELECT COUNT(*) FROM owner_alerts WHERE created_at >= ? AND created_at < ?"
+            started = (
+                "FROM campaign_contacts JOIN leads ON leads.lead_id = campaign_contacts.lead_id "
+                "WHERE campaign_contacts.started_at >= ? AND campaign_contacts.started_at < ?"
+            )
+            source_rows = connection.execute(
+                f"SELECT {_LEAD_SOURCE} AS source, COUNT(*) AS total FROM bookings "
+                "JOIN leads ON leads.lead_id = bookings.lead_id "
+                "WHERE bookings.booked_at >= ? AND bookings.booked_at < ? GROUP BY source",
+                window,
+            ).fetchall()
+            recent_rows = connection.execute(
+                f"SELECT leads.full_name, bookings.slot_label, {_LEAD_SOURCE} AS source FROM bookings "
+                "JOIN leads ON leads.lead_id = bookings.lead_id "
+                "WHERE bookings.booked_at >= ? AND bookings.booked_at < ? "
+                "ORDER BY bookings.booked_at DESC LIMIT 3",
+                window,
+            ).fetchall()
+            return MonthlyNumbers(
+                form_leads=count(form_leads_in_window),
+                form_leads_texted=count(f"{form_leads_in_window} AND leads.intake = 'text'"),
+                form_leads_replied=count(f"{form_leads_in_window} AND leads.intake = 'text' AND {replied}"),
+                form_leads_booked=count(f"{form_leads_in_window} AND {booked}"),
+                bookings=sum(row["total"] for row in source_rows),
+                bookings_by_source={row["source"]: row["total"] for row in source_rows},
+                calls_answered=count(calls_in_window),
+                calls_booked=count(f"{calls_in_window} AND result = 'booked'"),
+                calls_messages=count(f"{calls_in_window} AND result = 'message'"),
+                calls_hung_up=count(f"{calls_in_window} AND result = 'hung_up'"),
+                reactivation_started=count(f"SELECT COUNT(*) {started}"),
+                reactivation_replied=count(f"SELECT COUNT(*) {started} AND {replied}"),
+                reactivation_booked=count(f"SELECT COUNT(*) {started} AND {booked}"),
+                urgent_leaks=count(f"{alerts_in_window} AND reason = 'URGENT_active_leak'"),
+                alerts_for_owner=count(f"{alerts_in_window} AND reason != 'inspection_booked'"),
+                opted_out=count("SELECT COUNT(*) FROM do_not_call WHERE added_at >= ? AND added_at < ?"),
+                recent_bookings=[
+                    BookedInspection(row["full_name"], row["slot_label"], row["source"])
+                    for row in recent_rows
+                ],
+            )
+
+    def earliest_activity(self) -> datetime | None:
+        """When the first lead or call arrived, or None in an empty database. A month that ended
+        before this gets no report: a new install mustn't email the owner an empty one."""
+        with self._read() as connection:
+            row = connection.execute(
+                "SELECT MIN(first) FROM (SELECT MIN(created_at) AS first FROM leads "
+                "UNION ALL SELECT MIN(started_at) FROM calls)"
+            ).fetchone()
+        return None if row[0] is None else datetime.fromtimestamp(row[0], UTC)
+
+    def monthly_report_sent(self, month: str) -> bool:
+        with self._read() as connection:
+            row = connection.execute("SELECT 1 FROM monthly_reports WHERE month = ?", (month,)).fetchone()
+        return row is not None
+
+    def mark_monthly_report_sent(self, month: str, now: datetime) -> None:
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO monthly_reports (month, sent_at) VALUES (?, ?)",
+                (month, now.timestamp()),
             )
 
     def counts(self) -> dict[str, dict[str, int]]:

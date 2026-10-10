@@ -339,6 +339,14 @@ def main() -> None:
     threading.Thread(
         target=notifier.run_forever, args=(stop_notifier,), name="owner-alerts", daemon=True
     ).start()
+    # The monthly results email gets its own thread too, on the same email settings.
+    from .owner_alerts import EmailSettings
+    from .report import build_report_sender
+
+    reporter = build_report_sender(store, settings, EmailSettings.from_environment())
+    threading.Thread(
+        target=reporter.run_forever, args=(stop_notifier,), name="monthly-report", daemon=True
+    ).start()
     try:
         Worker(store, settings, services, sender).run_forever()
     except SenderCredentialsRejected as error:
