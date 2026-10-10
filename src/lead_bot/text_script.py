@@ -26,7 +26,7 @@ from .leads import pretty_phone
 from .settings import BusinessSettings
 from .slots import BookingRules, Slot
 from .text_questions import Stage
-from .timing import MAX_TEXT_ATTEMPTS
+from .timing import MAX_TEXT_ATTEMPTS, ConversationKind, max_text_attempts
 
 # ---- characters and length ----
 
@@ -143,13 +143,41 @@ def reminder_text(settings: BusinessSettings, full_name: str, address: str, is_l
     return text + " Reply STOP to opt out."
 
 
-def opening_text(settings: BusinessSettings, full_name: str, address: str, attempt: int) -> str:
-    """The opening text for this attempt: 1 is the first text, 2 and up are reminders."""
-    if not 1 <= attempt <= MAX_TEXT_ATTEMPTS:
-        raise ValueError(f"there is no opening text number {attempt}; the last is {MAX_TEXT_ATTEMPTS}")
+def opening_text(
+    settings: BusinessSettings, full_name: str, address: str, attempt: int, kind: ConversationKind = "form"
+) -> str:
+    """The opening text for this attempt: 1 is the first text, 2 and up are reminders. An old
+    lead from a reactivation list gets its own wording (reactivation_first_text)."""
+    last_attempt = max_text_attempts(kind)
+    if not 1 <= attempt <= last_attempt:
+        raise ValueError(f"there is no opening text number {attempt}; the last is {last_attempt}")
+    if kind == "reactivation":
+        if attempt == 1:
+            return reactivation_first_text(settings, full_name, address)
+        return reactivation_reminder_text(settings, full_name, address)
     if attempt == 1:
         return first_text(settings, full_name, address)
     return reminder_text(settings, full_name, address, is_last=attempt == MAX_TEXT_ATTEMPTS)
+
+
+def reactivation_first_text(settings: BusinessSettings, full_name: str, address: str) -> str:
+    """The first text to an old lead. Same disclosures as a form lead's first text. It says why
+    they're hearing from the business ("you asked us about your roof"), because the request is
+    old and an unexplained text from a business reads as spam."""
+    return (
+        f"Hi {first_name(full_name)}, this is the automated assistant for {settings.business_name}. "
+        f"You asked us about your roof a while back. {stage_question('still_interested', address, ())} "
+        f"{DISCLOSURES}"
+    )
+
+
+def reactivation_reminder_text(settings: BusinessSettings, full_name: str, address: str) -> str:
+    """The one reminder an old lead gets, and the last text unless they reply."""
+    return (
+        f"Hi {first_name(full_name)}, {settings.business_name} here again. "
+        f"{stage_question('still_interested', address, ())} This is our last text about it. "
+        "Reply STOP to opt out."
+    )
 
 
 # ---- the questions ----
@@ -158,6 +186,8 @@ def opening_text(settings: BusinessSettings, full_name: str, address: str, attem
 def stage_question(stage: Stage, address: str, offered_slots: Sequence[Slot]) -> str:
     """The question each stage asks. 'booked' asks nothing."""
     match stage:
+        case "still_interested":
+            return f"Would you still like a free roof inspection at {plain_punctuation(address)}?"
         case "address":
             return f"Is the inspection for {plain_punctuation(address)}?"
         case "leak":
@@ -199,6 +229,9 @@ NOT_CAUGHT_PREFIX = "Sorry, I didn't catch that."
 CONFUSION_PREFIX = "Sorry for the confusion."
 LATER_TEXT = "No problem. Reply whenever it suits you."
 WRONG_PERSON_TEXT = "Sorry about that. We won't text this number again."
+# An old lead who no longer needs an inspection. Also the one text after their number goes on
+# the do-not-call list: they owe the business nothing, so one "no" ends it for good.
+NOT_INTERESTED_TEXT = "No problem, thanks for letting us know. We won't text you about it again."
 NOT_HOMEOWNER_TEXT = (
     "Thanks. The inspection needs the owner's OK, so someone from our team will follow up with you."
 )

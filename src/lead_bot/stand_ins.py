@@ -75,6 +75,10 @@ class OfflineJev:
             return "repeat"
         if "change_booking" in options and re.search(r"\b(change|move|reschedule)\b", text):
             return "change_booking"
+        if "different_address" in options and re.search(r"\b(moved|different address|new address)\b", text):
+            return "different_address"
+        if "different_address" in options and re.search(r"\b(already fixed|sold|no longer)\b", text):
+            return "no"
         if text.rstrip().endswith("?"):
             return "other_question"
         if re.search(r"\b(busy|later|driving)\b", text):

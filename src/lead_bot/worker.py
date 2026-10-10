@@ -7,9 +7,10 @@
 
 Each pass of the loop does, in order:
   1. answer the incoming texts that are waiting (Store.claim_incoming_text)
-  2. queue the opening texts and reminders whose time has come
-  3. hand quiet conversations to a person
-  4. send what's queued
+  2. start the next contacts of any reactivation campaign whose turn has come (reactivation.py)
+  3. queue the opening texts and reminders whose time has come
+  4. hand quiet conversations to a person
+  5. send what's queued
 
 Owner alerts are emailed by a second thread (owner_alerts.py), so mail never delays a reply.
 
@@ -160,6 +161,8 @@ class Worker:
         answered = 0
         while self.answer_next_incoming():
             answered += 1
+        # Before queuing openings, so a contact started now gets its first text in this pass.
+        self._store.start_campaign_contacts(self._clock(), self.hours)
         queued = self.queue_due_openings()
         closed = len(self._store.close_quiet_conversations(self._clock(), QUIET_CONVERSATION_LIMIT))
         sent = 0
@@ -247,7 +250,7 @@ class Worker:
         now = self._clock()
         queued = 0
         for due in self._store.due_openings(now):
-            body = opening_text(self._settings, due.full_name, due.address, due.attempt)
+            body = opening_text(self._settings, due.full_name, due.address, due.attempt, due.kind)
             result = self._store.queue_opening_text(due.lead_id, due.attempt, body, now, self.hours)
             if result == "queued":
                 queued += 1

@@ -9,7 +9,9 @@ conversations.
 
 The stages, one question each:
     address -> leak -> insurance -> homeowner -> offer -> booked
-The first text asks the address question, so the homeowner's first reply answers it.
+The first text asks the address question, so the homeowner's first reply answers it. An old
+lead from a reactivation list starts at still_interested instead ("Would you still like a free
+roof inspection at <address>?"), which leads to leak on a yes.
 
 Every text the bot sends comes from text_script.py, except the writer's answers to off-script
 questions ("how long does the inspection take?"). A draft is sent only if guard.py passes it;
@@ -45,6 +47,7 @@ from .text_script import (
     NO_TIME_SUITED_TEXT,
     NOT_CAUGHT_PREFIX,
     NOT_HOMEOWNER_TEXT,
+    NOT_INTERESTED_TEXT,
     PRICE_LINE,
     QUESTION_FOR_TEAM_LINE,
     SLOT_TAKEN_PREFIX,
@@ -217,7 +220,23 @@ class Conversation:
             return
         self._outcome.unclear_in_a_row = 0
 
-        if stage == "address":
+        if stage == "still_interested":
+            # An old lead from a reactivation list. The question named the address, so a yes
+            # also confirms it.
+            if option == "no":
+                # One polite text, then the number goes on the do-not-call list: they owe the
+                # business nothing, and the next campaign mustn't text them again either.
+                self._outcome.do_not_contact_source = "no longer needs an inspection (reactivation list)"
+                self._outcome.stop_confirmation = NOT_INTERESTED_TEXT
+                self._close(result="not_interested")
+            elif option == "different_address":
+                self._outcome.answers["address_confirmed"] = "no"
+                self._outcome.owner_alerts.append("address_needs_correcting")
+                self._ask("leak", prefix=ADDRESS_WRONG_PREFIX)
+            else:
+                self._outcome.answers["address_confirmed"] = "yes"
+                self._ask("leak", prefix="Great.")
+        elif stage == "address":
             self._outcome.answers["address_confirmed"] = option
             if option == "no":
                 # Booking still goes ahead; the owner confirms the right address before the visit.

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 # The federal limits. 8:00 itself is allowed (the rule bans calls "before the hour of 8 a.m."),
@@ -41,6 +42,30 @@ DEFAULT_LATEST_TEXT = time(20, 30)
 # reminder doesn't push every later one back.
 REMINDER_DELAYS = (timedelta(hours=2), timedelta(days=1), timedelta(days=3))
 MAX_TEXT_ATTEMPTS = 1 + len(REMINDER_DELAYS)
+
+# A conversation either follows up a form the homeowner just sent, or reactivates an old lead
+# from a client's list (reactivation.py). An old lead gets one reminder, two days later: they
+# didn't just ask, and three reminders to someone cold reads as spam and draws complaints.
+ConversationKind = Literal["form", "reactivation"]
+REACTIVATION_REMINDER_DELAYS = (timedelta(days=2),)
+REMINDER_DELAYS_BY_KIND: dict[ConversationKind, tuple[timedelta, ...]] = {
+    "form": REMINDER_DELAYS,
+    "reactivation": REACTIVATION_REMINDER_DELAYS,
+}
+
+
+def max_text_attempts(kind: ConversationKind) -> int:
+    """The first text plus every reminder, for this kind of conversation."""
+    return 1 + len(REMINDER_DELAYS_BY_KIND[kind])
+
+
+def conversation_kind(value: str) -> ConversationKind:
+    """A kind read back from the database. A loop rather than a cast, so the type checker can
+    see only a known kind is ever returned."""
+    for kind in REMINDER_DELAYS_BY_KIND:
+        if kind == value:
+            return kind
+    raise ValueError(f"unknown conversation kind {value!r} in the database")
 
 # Two opening texts are never closer together than this. If the worker was down and planned
 # reminder times have passed, they'd otherwise all come due at once and arrive back to back.
@@ -97,14 +122,20 @@ def next_allowed_time(moment: datetime, hours: TextingHours) -> datetime:
 
 
 def reminder_time(
-    first_text_sent: datetime, texts_sent: int, now: datetime, hours: TextingHours
+    first_text_sent: datetime,
+    texts_sent: int,
+    now: datetime,
+    hours: TextingHours,
+    delays: tuple[timedelta, ...] = REMINDER_DELAYS,
 ) -> datetime | None:
-    """When to send the next reminder after `texts_sent` opening texts got no reply, or None to stop."""
+    """When to send the next reminder after `texts_sent` opening texts got no reply, or None to stop.
+
+    `delays` is the schedule for this kind of conversation (REMINDER_DELAYS_BY_KIND)."""
     if texts_sent < 1:
         raise ValueError("a reminder only exists after at least one text")
-    if texts_sent >= MAX_TEXT_ATTEMPTS:
+    if texts_sent >= 1 + len(delays):
         return None
-    planned = first_text_sent + REMINDER_DELAYS[texts_sent - 1]
+    planned = first_text_sent + delays[texts_sent - 1]
     earliest_permitted = now + MINIMUM_GAP_BETWEEN_TEXTS
     return next_allowed_time(max(planned, earliest_permitted), hours)
 

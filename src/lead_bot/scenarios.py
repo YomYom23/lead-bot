@@ -27,7 +27,7 @@ import tomllib
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -38,7 +38,7 @@ from .booking import CalendarBooking
 from .client_config import EXAMPLE_CLIENT_CONFIG_PATH, load_client_config
 from .consent import CONSENT_VERSION, ConsentEvidence, consent_text
 from .conversation import ConversationServices
-from .leads import parse_lead_form
+from .leads import ReactivationContact, parse_lead_form
 from .settings import BusinessSettings
 from .stand_ins import MemoryCalendar, OfflineJev
 from .store import Store
@@ -85,6 +85,9 @@ class Scenario:
     # True for wording only a real language model can follow. The --offline keyword stand-in
     # would fail these for its own reasons, so offline runs skip them.
     needs_real_jev: bool = False
+    # True: the homeowner is an old lead from a reactivation list, not a form lead. Their first
+    # text asks whether they still want an inspection, so `texts` starts with the answer to that.
+    reactivation: bool = False
     note: str = ""
 
 
@@ -111,6 +114,7 @@ def load_scenarios(path: Path) -> list[Scenario]:
         "never_say",
         "do_not_call",
         "needs_real_jev",
+        "reactivation",
         "note",
     }
     scenarios: list[Scenario] = []
@@ -134,6 +138,9 @@ def load_scenarios(path: Path) -> list[Scenario]:
         needs_real_jev = raw.get("needs_real_jev", False)
         if not isinstance(needs_real_jev, bool):
             raise ValueError(f"scenario {name}: needs_real_jev must be true or false")
+        reactivation = raw.get("reactivation", False)
+        if not isinstance(reactivation, bool):
+            raise ValueError(f"scenario {name}: reactivation must be true or false")
         texts = raw["texts"]
         if not isinstance(texts, list) or not all(isinstance(item, str) for item in texts):
             raise ValueError(f"scenario {name}: texts must be a list of strings (it may be empty)")
@@ -148,6 +155,7 @@ def load_scenarios(path: Path) -> list[Scenario]:
                 never_say=never_say,
                 do_not_call=do_not_call,
                 needs_real_jev=needs_real_jev,
+                reactivation=reactivation,
                 note=str(raw.get("note", "")),
             )
         )
@@ -252,17 +260,38 @@ def run_scenario(scenario: Scenario, services: ConversationServices, work_direct
     store = Store(work_directory / f"{scenario.name}.db")
     worker = Worker(store, settings, scenario_services, sender, clock=clock, on_turn=keep_writer_outcomes)
     lead = parse_lead_form("Dana Ruiz", "(602) 555-0142", "12 Saguaro Ln, Mesa AZ", "storm_damage")
-    consent = ConsentEvidence(
-        given=True,
-        version=CONSENT_VERSION,
-        text_shown=consent_text(settings.business_name),
-        ip_address="127.0.0.1",
-        forwarded_for=None,
-        user_agent="scenario runner",
-        source="scenarios.py",
-    )
-    added = store.add_lead(lead, consent, clock(), settings.texting_hours)
-    lead_id = added.lead_id
+    if scenario.reactivation:
+        # The same homeowner as an old lead on a client's list, started by the worker like any
+        # campaign contact (Store.start_campaign_contacts).
+        imported = store.add_campaign(
+            "scenario",
+            "texts.toml",
+            50,
+            [
+                ReactivationContact(
+                    full_name=lead.full_name,
+                    phone=lead.phone,
+                    address=lead.address,
+                    consented_on=date(2025, 3, 14),
+                    consent_source="scenarios.py",
+                    consent_wording=consent_text(settings.business_name),
+                )
+            ],
+            clock(),
+            settings.texting_hours,
+        )
+        lead_id = imported.lead_ids[0]
+    else:
+        consent = ConsentEvidence(
+            given=True,
+            version=CONSENT_VERSION,
+            text_shown=consent_text(settings.business_name),
+            ip_address="127.0.0.1",
+            forwarded_for=None,
+            user_agent="scenario runner",
+            source="scenarios.py",
+        )
+        lead_id = store.add_lead(lead, consent, clock(), settings.texting_hours).lead_id
     report = ScenarioReport(
         scenario=scenario,
         opening=(),
@@ -331,8 +360,11 @@ def check_scenario(report: ScenarioReport) -> list[str]:
                 failures.append(f"said /{pattern}/: {text!r}")
 
     # Rules every conversation must keep, whatever the script says.
-    if report.result == "opted_out" and not report.on_do_not_call:
-        failures.append("opted out but the number isn't on the do-not-call list")
+    if report.result in ("opted_out", "not_interested") and not report.on_do_not_call:
+        failures.append(f"ended as {report.result} but the number isn't on the do-not-call list")
+    if scenario.reactivation and "no_reply_to_any_text" in report.alerts:
+        # A campaign of 1,000 would email the owner about every contact who didn't answer.
+        failures.append("an old lead who never replied raised an owner alert")
     if report.result == "booked" and report.booking is None:
         failures.append("ended as booked but no booking was recorded")
     if report.result != "booked" and report.booking is not None:

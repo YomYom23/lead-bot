@@ -20,10 +20,14 @@ from .jev import Question
 from .slots import Slot
 
 # Where a conversation can be, in order. The first text asks the address question, so a new
-# conversation starts at "address". "offer" is when inspection times have been texted. "booked"
-# is after the booking: the bot still answers questions, but asks nothing more.
-Stage = Literal["address", "leak", "insurance", "homeowner", "offer", "booked"]
-STAGES: tuple[Stage, ...] = ("address", "leak", "insurance", "homeowner", "offer", "booked")
+# conversation starts at "address". An old lead from a reactivation list starts one step earlier,
+# at "still_interested": their first text asks whether they still want an inspection at that
+# address, and a yes moves them on to "leak". "offer" is when inspection times have been texted.
+# "booked" is after the booking: the bot still answers questions, but asks nothing more.
+Stage = Literal["still_interested", "address", "leak", "insurance", "homeowner", "offer", "booked"]
+STAGES: tuple[Stage, ...] = (
+    "still_interested", "address", "leak", "insurance", "homeowner", "offer", "booked"
+)
 
 HAZARD_QUESTIONS: dict[str, Question] = {
     # STOP and the clear ways of saying it are caught by keywords before Jev is asked
@@ -63,6 +67,12 @@ OFF_SCRIPT_OPTIONS: dict[str, str] = {
 }
 
 STAGE_OPTIONS: dict[Stage, dict[str, str]] = {
+    "still_interested": {
+        "yes": "Still wants a free roof inspection at that address",
+        "different_address": "Wants an inspection, but at a different address",
+        "no": "Doesn't need one any more, for example it's already fixed, they used another company, "
+        "or they sold the house",
+    },
     "address": {
         "yes": "Confirms the inspection is for that address",
         "no": "Says it's a different address, or corrects it",

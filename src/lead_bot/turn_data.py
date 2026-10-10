@@ -23,6 +23,8 @@ from .text_questions import Stage
 # owner_alerted   -> no automated texts at all (no consent, or opted out before); owner alerted
 # duplicate       -> the number already had a conversation open when this form arrived
 # opted_out       -> the number went on the do-not-call list
+# campaign_waiting -> an old lead from a reactivation list, waiting for its turn under the
+#                     campaign's daily limit (Store.start_campaign_contacts)
 LeadStatus = Literal[
     "following_up",
     "in_conversation",
@@ -32,6 +34,7 @@ LeadStatus = Literal[
     "owner_alerted",
     "duplicate",
     "opted_out",
+    "campaign_waiting",
 ]
 
 

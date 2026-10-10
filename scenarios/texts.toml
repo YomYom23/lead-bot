@@ -16,6 +16,9 @@
 #                   "insurance" here: the fixed insurance text itself says the word.
 #   do_not_call     true/false: whether the number must end up on the do-not-call list
 #   needs_real_jev  true when only a real model can follow the wording; --offline skips it
+#   reactivation    true for an old lead from a client's list: the first text asks "Would you
+#                   still like a free roof inspection at <address>?", so `texts` starts with
+#                   the answer to that, and there is one reminder instead of three
 #   note            why the scenario exists, shown in the report
 #
 # Checked on every conversation, whatever the scenario says: an opt-out puts the number on the
@@ -516,3 +519,59 @@ result = "booked"
 never_say = ['yes,? (you should|put)', 'go (up|on) (the|your) roof', 'climb']
 note = "Safety advice isn't in the facts: the team should answer, the bot shouldn't improvise."
 alerts_include = ["homeowner_question_for_the_team"]
+
+# ---------------------------------------------------------------------------------------------
+# Reactivation: old leads from a client's list
+# ---------------------------------------------------------------------------------------------
+
+[[scenario]]
+name = "reactivated_and_booked"
+category = "reactivation"
+reactivation = true
+texts = ["Yes, I'd still like that", "No", "No", "Yes", "{first_time}", "thanks"]
+result = "booked"
+answers = { address_confirmed = "yes", active_leak = "no" }
+do_not_call = false
+
+[[scenario]]
+name = "reactivation_already_fixed"
+category = "reactivation"
+reactivation = true
+texts = ["No, we already fixed it last year"]
+result = ["not_interested", "opted_out"]
+do_not_call = true
+note = "A cold lead who no longer needs it gets one polite text and is never texted again."
+
+[[scenario]]
+name = "reactivation_sold_the_house"
+category = "reactivation"
+reactivation = true
+texts = ["We sold that house in the spring"]
+result = ["not_interested", "opted_out", "wrong_person"]
+do_not_call = true
+
+[[scenario]]
+name = "reactivation_moved"
+category = "reactivation"
+reactivation = true
+texts = ["Yes but we moved, it's 40 Palm Dr in Gilbert now", "No", "No", "Yes", "{first_time}"]
+result = "booked"
+answers = { address_confirmed = "no" }
+alerts_include = ["address_needs_correcting"]
+note = "Still interested at a new address: the owner is told to confirm it before the visit."
+
+[[scenario]]
+name = "reactivation_never_replies"
+category = "reactivation"
+reactivation = true
+texts = []
+result = "unreached"
+note = "One reminder, then nothing, and no owner alert: a big list would flood the owner otherwise."
+
+[[scenario]]
+name = "reactivation_stop"
+category = "reactivation"
+reactivation = true
+texts = ["STOP"]
+result = "opted_out"
+do_not_call = true

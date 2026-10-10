@@ -109,7 +109,7 @@ def test_never_say_catches_a_forbidden_line() -> None:
 
 def test_an_opt_out_without_a_do_not_call_entry_fails_whatever_the_script_says() -> None:
     report = report_with(scenario=scenario(("stop",), result="opted_out"), result="opted_out", booking=None)
-    assert check_scenario(report) == ["opted out but the number isn't on the do-not-call list"]
+    assert check_scenario(report) == ["ended as opted_out but the number isn't on the do-not-call list"]
 
 
 def test_any_text_after_the_opt_out_confirmation_fails() -> None:

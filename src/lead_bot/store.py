@@ -22,18 +22,27 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal
 
 from .consent import ConsentEvidence
-from .leads import IntakeDecision, NewLead, decide_intake
+from .leads import IntakeDecision, NewLead, ReactivationContact, decide_intake
 from .slots import Slot
 from .text_questions import STAGES, Stage
-from .timing import MAX_TEXT_ATTEMPTS, TextingHours, is_allowed, next_allowed_time, reminder_time
+from .timing import (
+    REMINDER_DELAYS_BY_KIND,
+    ConversationKind,
+    TextingHours,
+    conversation_kind,
+    is_allowed,
+    max_text_attempts,
+    next_allowed_time,
+    reminder_time,
+)
 from .turn_data import ConversationState, LeadStatus, TurnOutcome
 from .writer import Turn
 
@@ -61,7 +70,10 @@ CREATE TABLE IF NOT EXISTS consents (
     forwarded_for TEXT,
     user_agent    TEXT NOT NULL,
     source        TEXT NOT NULL,
-    recorded_at   REAL NOT NULL
+    recorded_at   REAL NOT NULL,
+    -- When the person consented, if that was before it was recorded here: an old lead imported
+    -- from a client's list (reactivation.py). NULL for a form lead, who consented at recorded_at.
+    consented_at  REAL
 );
 
 -- One row per lead the bot texts, made with the lead. Where the conversation is, so each
@@ -77,7 +89,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     next_opening_due_at REAL,                       -- the next opening text or reminder; NULL if none
     closed              INTEGER NOT NULL DEFAULT 0, -- 1: a person has taken over; the bot stays quiet
     result              TEXT,                       -- how the bot's part ended, e.g. 'booked'
-    last_activity_at    REAL NOT NULL               -- the last text either way
+    last_activity_at    REAL NOT NULL,              -- the last text either way
+    kind                TEXT NOT NULL DEFAULT 'form' -- a ConversationKind: 'form' or 'reactivation'
 );
 CREATE INDEX IF NOT EXISTS conversations_due ON conversations (next_opening_due_at);
 
@@ -165,6 +178,27 @@ CREATE TABLE IF NOT EXISTS alert_texts (
     gave_up             INTEGER NOT NULL DEFAULT 0,  -- 1: refused, or may have gone; never retried
     last_error          TEXT
 );
+
+-- Reactivation campaigns (reactivation.py): a client's list of old leads, texted a few a day.
+CREATE TABLE IF NOT EXISTS campaigns (
+    campaign_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL UNIQUE,
+    source_file     TEXT NOT NULL,          -- the list it was imported from
+    daily_limit     INTEGER NOT NULL,       -- most contacts started per day
+    created_at      REAL NOT NULL,
+    last_started_at REAL                    -- when the last contact was started; spaces them out
+);
+
+-- One row per contact imported into a campaign. The contact itself is an ordinary lead (with
+-- its consent row and a 'reactivation' conversation), so everything after the first text works
+-- exactly as for a form lead.
+CREATE TABLE IF NOT EXISTS campaign_contacts (
+    lead_id     INTEGER PRIMARY KEY REFERENCES leads (lead_id),
+    campaign_id INTEGER NOT NULL REFERENCES campaigns (campaign_id),
+    started_at  REAL,                       -- NULL while waiting for its turn
+    skipped     TEXT                        -- why it was never started, e.g. 'opted out since import'
+);
+CREATE INDEX IF NOT EXISTS campaign_contacts_waiting ON campaign_contacts (campaign_id, started_at);
 """
 
 # homeowner         -> a text the homeowner sent us
@@ -215,6 +249,46 @@ class AddedLead:
     first_text_due: datetime | None  # None when the bot won't text
 
 
+# The consent version stored for an imported contact. The exact words they agreed to are in
+# text_shown, as for a form lead; this marks that the business, not our form, collected them.
+IMPORTED_CONSENT_VERSION = "imported-list"
+
+
+class CampaignExists(ValueError):
+    """A campaign with that name was already imported."""
+
+
+@dataclass
+class CampaignImport:
+    """What importing a contact list did (or, for a dry run, would do)."""
+
+    campaign_id: int | None  # None after a dry run
+    lead_ids: list[int]  # the contacts added, one lead each
+    skipped: dict[str, list[str]]  # why -> the phone numbers left out for that reason
+
+    @property
+    def added(self) -> int:
+        return len(self.lead_ids)
+
+
+@dataclass(frozen=True)
+class CampaignSummary:
+    name: str
+    daily_limit: int
+    created_at: datetime
+    contacts_by_status: dict[str, int]  # LeadStatus -> how many; campaign_waiting = not texted yet
+    skipped: int  # left out at their turn (opted out or in a conversation since the import)
+
+
+class _RollBackDryRun(Exception):
+    """Raised inside add_campaign's transaction on a dry run, so the transaction rolls back and
+    the result comes out with it."""
+
+    def __init__(self, result: CampaignImport) -> None:
+        super().__init__("dry run")
+        self.result = result
+
+
 @dataclass(frozen=True)
 class DueOpening:
     """An opening text whose time has come. The worker words it; queue_opening_text re-checks it."""
@@ -223,6 +297,7 @@ class DueOpening:
     attempt: int  # 1 = the first text, 2 and up = reminders
     full_name: str
     address: str
+    kind: ConversationKind = "form"  # an old lead from a reactivation list has its own wording
 
 
 @dataclass(frozen=True)
@@ -304,6 +379,7 @@ class LeadSummary:
     answers: dict[str, str]
     booking: str | None
     transcript: list[TranscriptLine]
+    campaign: str | None = None  # the reactivation campaign it came from; None for a form lead
 
 
 class Store:
@@ -321,6 +397,15 @@ class Store:
                 connection.execute(
                     "ALTER TABLE owner_alerts ADD COLUMN text_id INTEGER REFERENCES texts (text_id)"
                 )
+            conversation_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(conversations)")
+            }
+            if "kind" not in conversation_columns:
+                # Every conversation before reactivation existed followed up a form.
+                connection.execute("ALTER TABLE conversations ADD COLUMN kind TEXT NOT NULL DEFAULT 'form'")
+            consent_columns = {row["name"] for row in connection.execute("PRAGMA table_info(consents)")}
+            if "consented_at" not in consent_columns:
+                connection.execute("ALTER TABLE consents ADD COLUMN consented_at REAL")
         finally:
             connection.close()
 
@@ -439,14 +524,133 @@ class Store:
         with self._write_transaction() as connection:
             _add_owner_alert(connection, lead_id, reason, now)
 
+    # ---- reactivation campaigns (reactivation.py) ----
+
+    def add_campaign(
+        self,
+        name: str,
+        source_file: str,
+        daily_limit: int,
+        contacts: Sequence[ReactivationContact],
+        now: datetime,
+        hours: TextingHours,
+        save: bool = True,
+    ) -> CampaignImport:
+        """Import a checked contact list as a campaign, all in one transaction.
+
+        Each contact becomes an ordinary lead with its consent evidence and a 'reactivation'
+        conversation, waiting for its turn (start_campaign_contacts). A contact is left out when
+        its number is on the do-not-call list, already in a conversation, or in an earlier
+        campaign: texting someone twice from two lists is how complaints start.
+
+        save=False is the dry run: everything is checked inside the transaction exactly as for
+        real, then rolled back, so the counts it reports are the ones a real import would give.
+        """
+        if daily_limit < 1:
+            raise ValueError("a campaign's daily limit must be at least 1")
+        try:
+            with self._write_transaction() as connection:
+                if connection.execute("SELECT 1 FROM campaigns WHERE name = ?", (name,)).fetchone():
+                    raise CampaignExists(f"there is already a campaign named {name!r}; pick another name")
+                cursor = connection.execute(
+                    "INSERT INTO campaigns (name, source_file, daily_limit, created_at) VALUES (?, ?, ?, ?)",
+                    (name, source_file, daily_limit, now.timestamp()),
+                )
+                campaign_id = cursor.lastrowid
+                if campaign_id is None:  # can't happen after an INSERT, but the type allows it
+                    raise RuntimeError("SQLite returned no id for the new campaign")
+                result = CampaignImport(campaign_id=campaign_id if save else None, lead_ids=[], skipped={})
+                for contact in contacts:
+                    reason = _reason_to_leave_out(connection, contact.phone)
+                    if reason is not None:
+                        result.skipped.setdefault(reason, []).append(contact.phone)
+                        continue
+                    result.lead_ids.append(
+                        _add_campaign_contact(connection, campaign_id, source_file, contact, now, hours)
+                    )
+                if not save:
+                    raise _RollBackDryRun(result)
+                return result
+        except _RollBackDryRun as dry_run:
+            return dry_run.result
+
+    def start_campaign_contacts(self, now: datetime, hours: TextingHours) -> int:
+        """Start the next waiting contact of each campaign whose turn has come. Returns how many.
+
+        A campaign starts at most `daily_limit` contacts per local day, spread evenly across the
+        texting window rather than all at the opening. 1,000 texts at 8 AM would bring a burst
+        of replies all wanting the same few inspection times, and a wave of owner alerts.
+
+        Each contact is checked again right before it starts, since days may have passed since
+        the import: on the do-not-call list now, or in a conversation now (they filled in the
+        form meanwhile), and it's skipped instead. queue_opening_text then checks consent and
+        the do-not-call list once more, as it does for every opening text.
+        """
+        if not is_allowed(now, hours):
+            return 0
+        local_now = now.astimezone(hours.timezone)
+        start_of_today = datetime.combine(local_now.date(), time(0), tzinfo=hours.timezone)
+        started = 0
+        with self._write_transaction() as connection:
+            campaigns = connection.execute(
+                "SELECT campaign_id, daily_limit, last_started_at FROM campaigns WHERE EXISTS ("
+                "SELECT 1 FROM campaign_contacts WHERE campaign_contacts.campaign_id = campaigns.campaign_id "
+                "AND started_at IS NULL AND skipped IS NULL)"
+            ).fetchall()
+            for campaign in campaigns:
+                started_today = connection.execute(
+                    "SELECT COUNT(*) FROM campaign_contacts WHERE campaign_id = ? AND started_at >= ?",
+                    (campaign["campaign_id"], start_of_today.timestamp()),
+                ).fetchone()[0]
+                if started_today >= campaign["daily_limit"]:
+                    continue
+                last_started_at = campaign["last_started_at"]
+                spacing = _start_spacing(hours, campaign["daily_limit"]).total_seconds()
+                if last_started_at is not None and now.timestamp() - last_started_at < spacing:
+                    continue
+                if _start_next_contact(connection, campaign["campaign_id"], now):
+                    started += 1
+        return started
+
+    def campaign_summaries(self) -> list[CampaignSummary]:
+        """Every campaign with its contacts counted by where they are, for `reactivation status`."""
+        with self._read() as connection:
+            campaigns = connection.execute(
+                "SELECT campaign_id, name, daily_limit, created_at FROM campaigns ORDER BY campaign_id"
+            ).fetchall()
+            summaries: list[CampaignSummary] = []
+            for campaign in campaigns:
+                rows = connection.execute(
+                    "SELECT leads.status, COUNT(*) AS total FROM campaign_contacts "
+                    "JOIN leads ON leads.lead_id = campaign_contacts.lead_id "
+                    "WHERE campaign_contacts.campaign_id = ? AND campaign_contacts.skipped IS NULL "
+                    "GROUP BY leads.status",
+                    (campaign["campaign_id"],),
+                ).fetchall()
+                skipped = connection.execute(
+                    "SELECT COUNT(*) FROM campaign_contacts WHERE campaign_id = ? AND skipped IS NOT NULL",
+                    (campaign["campaign_id"],),
+                ).fetchone()[0]
+                summaries.append(
+                    CampaignSummary(
+                        name=campaign["name"],
+                        daily_limit=campaign["daily_limit"],
+                        created_at=datetime.fromtimestamp(campaign["created_at"], UTC),
+                        contacts_by_status={row["status"]: row["total"] for row in rows},
+                        skipped=skipped,
+                    )
+                )
+        return summaries
+
     # ---- opening texts and reminders ----
 
     def due_openings(self, now: datetime) -> list[DueOpening]:
         """Opening texts and reminders whose time has come, most overdue first."""
         with self._read() as connection:
             rows = connection.execute(
-                "SELECT conversations.lead_id, conversations.opening_texts_sent, leads.full_name, "
-                "leads.address FROM conversations JOIN leads ON leads.lead_id = conversations.lead_id "
+                "SELECT conversations.lead_id, conversations.opening_texts_sent, conversations.kind, "
+                "leads.full_name, leads.address FROM conversations "
+                "JOIN leads ON leads.lead_id = conversations.lead_id "
                 "WHERE conversations.next_opening_due_at <= ? AND conversations.closed = 0 "
                 "AND leads.status = 'following_up' ORDER BY conversations.next_opening_due_at",
                 (now.timestamp(),),
@@ -457,6 +661,7 @@ class Store:
                 attempt=row["opening_texts_sent"] + 1,
                 full_name=row["full_name"],
                 address=row["address"],
+                kind=conversation_kind(row["kind"]),
             )
             for row in rows
         ]
@@ -476,7 +681,8 @@ class Store:
         with self._write_transaction() as connection:
             row = connection.execute(
                 "SELECT conversations.opening_texts_sent, conversations.first_text_at, "
-                "conversations.next_opening_due_at, conversations.closed, leads.status, leads.phone, "
+                "conversations.next_opening_due_at, conversations.closed, conversations.kind, "
+                "leads.status, leads.phone, "
                 "consents.given AS consent_given, "
                 "EXISTS (SELECT 1 FROM do_not_call WHERE do_not_call.phone = leads.phone) AS on_do_not_call "
                 "FROM conversations JOIN leads ON leads.lead_id = conversations.lead_id "
@@ -511,7 +717,8 @@ class Store:
                 return "rescheduled"
 
             first_text_at = now if attempt == 1 else datetime.fromtimestamp(row["first_text_at"], UTC)
-            next_due = reminder_time(first_text_at, attempt, now, hours)
+            kind = conversation_kind(row["kind"])
+            next_due = reminder_time(first_text_at, attempt, now, hours, REMINDER_DELAYS_BY_KIND[kind])
             connection.execute(
                 "UPDATE conversations SET opening_texts_sent = ?, first_text_at = ?, "
                 "next_opening_due_at = ?, last_activity_at = ? WHERE lead_id = ?",
@@ -531,19 +738,24 @@ class Store:
 
         Two kinds:
           - Every opening text went out and none got a reply: 'unreached'. The conversation stays
-            open, so a reply that comes later still gets answered.
+            open, so a reply that comes later still gets answered. The owner is alerted for a
+            form lead, who asked recently and may pick up a call. Not for an old lead from a
+            reactivation list: a campaign of 1,000 would email the owner hundreds of times about
+            people who simply didn't answer, and the campaign report counts them instead.
           - The homeowner stopped replying partway: 'handed_off', and the bot stops.
         """
         cutoff = (now - quiet_for).timestamp()
         changed: list[int] = []
         with self._write_transaction() as connection:
             unreached = connection.execute(
-                "SELECT conversations.lead_id FROM conversations "
+                "SELECT conversations.lead_id, conversations.kind FROM conversations "
                 "JOIN leads ON leads.lead_id = conversations.lead_id "
                 "WHERE leads.status = 'following_up' AND conversations.closed = 0 "
-                "AND conversations.next_opening_due_at IS NULL AND conversations.opening_texts_sent >= ? "
+                "AND conversations.next_opening_due_at IS NULL "
+                "AND conversations.opening_texts_sent >= "
+                "CASE conversations.kind WHEN 'reactivation' THEN ? ELSE ? END "
                 "AND conversations.last_activity_at <= ?",
-                (MAX_TEXT_ATTEMPTS, cutoff),
+                (max_text_attempts("reactivation"), max_text_attempts("form"), cutoff),
             ).fetchall()
             for row in unreached:
                 connection.execute(
@@ -552,7 +764,8 @@ class Store:
                 connection.execute(
                     "UPDATE conversations SET result = 'unreached' WHERE lead_id = ?", (row["lead_id"],)
                 )
-                _add_owner_alert(connection, row["lead_id"], "no_reply_to_any_text", now)
+                if row["kind"] != "reactivation":
+                    _add_owner_alert(connection, row["lead_id"], "no_reply_to_any_text", now)
                 changed.append(row["lead_id"])
             stalled = connection.execute(
                 "SELECT conversations.lead_id FROM conversations "
@@ -1120,6 +1333,12 @@ def _lead_summary(connection: sqlite3.Connection, lead_id: int) -> LeadSummary |
     texts = connection.execute(
         "SELECT direction, kind, body, status FROM texts WHERE lead_id = ? ORDER BY text_id", (lead_id,)
     ).fetchall()
+    campaign = connection.execute(
+        "SELECT campaigns.name FROM campaign_contacts "
+        "JOIN campaigns ON campaigns.campaign_id = campaign_contacts.campaign_id "
+        "WHERE campaign_contacts.lead_id = ?",
+        (lead_id,),
+    ).fetchone()
     return LeadSummary(
         lead_id=lead_id,
         full_name=lead["full_name"],
@@ -1131,6 +1350,7 @@ def _lead_summary(connection: sqlite3.Connection, lead_id: int) -> LeadSummary |
         transcript=[
             TranscriptLine(row["direction"], row["kind"], row["body"], row["status"]) for row in texts
         ],
+        campaign=None if campaign is None else str(campaign["name"]),
     )
 
 
@@ -1210,9 +1430,136 @@ def _add_to_do_not_call(connection: sqlite3.Connection, phone: str, source: str,
     )
     connection.execute(
         "UPDATE leads SET status = 'opted_out' WHERE phone = ? "
-        "AND status IN ('following_up', 'in_conversation', 'unreached', 'handed_off')",
+        # campaign_waiting: an opt-out from any conversation also stops a reactivation
+        # campaign that hasn't texted this number yet.
+        "AND status IN ('following_up', 'in_conversation', 'unreached', 'handed_off', 'campaign_waiting')",
         (phone,),
     )
+
+
+def _has_active_lead(connection: sqlite3.Connection, phone: str, except_lead_id: int | None = None) -> bool:
+    """Whether this number has a conversation going (other than `except_lead_id`'s own)."""
+    placeholders = ", ".join("?" for _ in ACTIVE_LEAD_STATUSES)
+    row = connection.execute(
+        f"SELECT 1 FROM leads WHERE phone = ? AND status IN ({placeholders}) AND lead_id IS NOT ?",
+        (phone, *ACTIVE_LEAD_STATUSES, except_lead_id),
+    ).fetchone()
+    return row is not None
+
+
+def _reason_to_leave_out(connection: sqlite3.Connection, phone: str) -> str | None:
+    """Why a contact on an imported list can't join the campaign, or None if it can."""
+    if _is_on_do_not_call(connection, phone):
+        return "on the do-not-call list"
+    if _has_active_lead(connection, phone):
+        return "already in a conversation"
+    in_a_campaign = connection.execute(
+        "SELECT 1 FROM campaign_contacts JOIN leads ON leads.lead_id = campaign_contacts.lead_id "
+        "WHERE leads.phone = ?",
+        (phone,),
+    ).fetchone()
+    if in_a_campaign is not None:
+        return "in an earlier campaign"
+    return None
+
+
+def _add_campaign_contact(
+    connection: sqlite3.Connection,
+    campaign_id: int,
+    source_file: str,
+    contact: ReactivationContact,
+    now: datetime,
+    hours: TextingHours,
+) -> int:
+    """One imported contact as a lead, its consent evidence, a waiting conversation and its
+    campaign row. Returns the lead id."""
+    cursor = connection.execute(
+        "INSERT INTO leads (full_name, phone, address, problem, created_at, intake, status) "
+        # 'not_sure': the list has no problem type, and the conversation asks about leaks anyway.
+        "VALUES (?, ?, ?, 'not_sure', ?, 'text', 'campaign_waiting')",
+        (contact.full_name, contact.phone, contact.address, now.timestamp()),
+    )
+    lead_id = cursor.lastrowid
+    if lead_id is None:  # can't happen after an INSERT, but the type allows it
+        raise RuntimeError("SQLite returned no id for the new lead")
+    # The list gives a date, not a time. Midday keeps it on that date in any US timezone.
+    consented_at = datetime.combine(contact.consented_on, time(12), tzinfo=hours.timezone)
+    connection.execute(
+        "INSERT INTO consents (lead_id, given, version, text_shown, ip_address, forwarded_for, "
+        "user_agent, source, recorded_at, consented_at) VALUES (?, 1, ?, ?, ?, NULL, ?, ?, ?, ?)",
+        (
+            lead_id,
+            IMPORTED_CONSENT_VERSION,
+            contact.consent_wording,
+            "not recorded (imported list)",
+            f"imported from {source_file}",
+            contact.consent_source,
+            now.timestamp(),
+            consented_at.timestamp(),
+        ),
+    )
+    # No first text due yet: start_campaign_contacts sets it when the contact's turn comes.
+    connection.execute(
+        "INSERT INTO conversations (lead_id, stage, next_opening_due_at, last_activity_at, kind) "
+        "VALUES (?, 'still_interested', NULL, ?, 'reactivation')",
+        (lead_id, now.timestamp()),
+    )
+    connection.execute(
+        "INSERT INTO campaign_contacts (lead_id, campaign_id) VALUES (?, ?)", (lead_id, campaign_id)
+    )
+    return lead_id
+
+
+def _start_spacing(hours: TextingHours, daily_limit: int) -> timedelta:
+    """The gap between two contacts of one campaign: the texting window shared evenly. With the
+    8:00-20:30 window and 50 a day, one every 15 minutes."""
+    window = datetime.combine(date.min, hours.latest) - datetime.combine(date.min, hours.earliest)
+    return window / daily_limit
+
+
+def _start_next_contact(connection: sqlite3.Connection, campaign_id: int, now: datetime) -> bool:
+    """Start the campaign's oldest waiting contact that may still be texted, skipping (for good)
+    any that may not. False when none could be started."""
+    waiting = connection.execute(
+        "SELECT campaign_contacts.lead_id, leads.phone, leads.status FROM campaign_contacts "
+        "JOIN leads ON leads.lead_id = campaign_contacts.lead_id "
+        "WHERE campaign_contacts.campaign_id = ? AND campaign_contacts.started_at IS NULL "
+        "AND campaign_contacts.skipped IS NULL ORDER BY campaign_contacts.lead_id",
+        (campaign_id,),
+    ).fetchall()
+    for contact in waiting:
+        lead_id = contact["lead_id"]
+        if contact["status"] != "campaign_waiting":
+            # Usually an opt-out from another conversation since the import (_add_to_do_not_call).
+            _skip_contact(connection, lead_id, f"was {contact['status']} before its turn")
+            continue
+        if _is_on_do_not_call(connection, contact["phone"]):
+            # A do-not-call row added by hand doesn't change lead statuses, so check it here too.
+            _skip_contact(connection, lead_id, "on the do-not-call list")
+            connection.execute("UPDATE leads SET status = 'opted_out' WHERE lead_id = ?", (lead_id,))
+            continue
+        if _has_active_lead(connection, contact["phone"], except_lead_id=lead_id):
+            # They filled in the form since the import: one conversation per number.
+            _skip_contact(connection, lead_id, "already in a conversation")
+            connection.execute("UPDATE leads SET status = 'duplicate' WHERE lead_id = ?", (lead_id,))
+            continue
+        connection.execute("UPDATE leads SET status = 'following_up' WHERE lead_id = ?", (lead_id,))
+        connection.execute(
+            "UPDATE conversations SET next_opening_due_at = ?, last_activity_at = ? WHERE lead_id = ?",
+            (now.timestamp(), now.timestamp(), lead_id),
+        )
+        connection.execute(
+            "UPDATE campaign_contacts SET started_at = ? WHERE lead_id = ?", (now.timestamp(), lead_id)
+        )
+        connection.execute(
+            "UPDATE campaigns SET last_started_at = ? WHERE campaign_id = ?", (now.timestamp(), campaign_id)
+        )
+        return True
+    return False
+
+
+def _skip_contact(connection: sqlite3.Connection, lead_id: int, reason: str) -> None:
+    connection.execute("UPDATE campaign_contacts SET skipped = ? WHERE lead_id = ?", (reason, lead_id))
 
 
 def _stop_opening_texts(

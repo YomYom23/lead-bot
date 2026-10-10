@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Literal
 
 ProblemType = Literal["active_leak", "storm_damage", "repair", "replacement", "not_sure"]
@@ -52,6 +53,22 @@ class NewLead:
     phone: str  # E.164, e.g. +16025550142: the format Twilio requires
     address: str
     problem: ProblemType
+
+
+@dataclass(frozen=True)
+class ReactivationContact:
+    """One old lead from a client's list, already checked (reactivation.read_contact_list).
+
+    The consent fields are the proof that this person agreed to texts from the business, so
+    every one is required: a contact the client can't show consent for is never texted.
+    """
+
+    full_name: str
+    phone: str  # E.164
+    address: str
+    consented_on: date
+    consent_source: str  # where they agreed, e.g. the web form's address
+    consent_wording: str  # the exact words they agreed to
 
 
 def parse_lead_form(full_name: str, phone: str, address: str, problem: str) -> NewLead:

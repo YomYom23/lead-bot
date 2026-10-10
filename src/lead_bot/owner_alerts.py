@@ -248,11 +248,17 @@ def build_alert_email(
     if lead is not None:
         # The leads table stores the form's problem as text, so it's looked up as plain text.
         problem_labels: dict[str, str] = {str(problem): label for problem, label in PROBLEM_LABELS.items()}
+        # An old lead from a reactivation list filled in no form; say where it came from instead.
+        origin = (
+            f"From the reactivation list: {lead.campaign}"
+            if lead.campaign is not None
+            else f"On the form: {problem_labels.get(lead.problem, lead.problem)}"
+        )
         lines += [
             f"Name: {lead.full_name}",
             f"Phone: {pretty_phone(lead.phone)}",
             f"Address: {lead.address}",
-            f"On the form: {problem_labels.get(lead.problem, lead.problem)}",
+            origin,
             f"Inspection: {lead.booking or 'not booked'}",
         ]
         if lead.answers:

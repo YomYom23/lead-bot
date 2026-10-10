@@ -43,6 +43,24 @@ and the calendar failing. Only alerts under two hours old are texted, and a text
 refused or may have gone is never resent; the email carries every alert either way. The owner
 texting back ("ok, calling her") is ignored, not turned into a new alert.
 
+Reactivation (`reactivation.py`) texts a client's old leads, asking whether they still want a
+free roof inspection. The client's list is a CSV with `full_name, phone, address, consent_date,
+consent_source, consent_wording`; a row missing any consent value is refused, because a text the
+business can't show consent for is the costly kind. Each contact becomes an ordinary lead, so the
+conversation, booking, opt-out and alerts are the same as for a form lead. The worker starts up
+to the daily limit (50 by default) spread across the texting window, re-checking the do-not-call
+list at each contact's turn. An old lead gets one reminder, two days later. One who never replies
+raises no owner alert, and "no, already fixed" ends with one polite text and the do-not-call list.
+
+```bash
+uv run python -m lead_bot.reactivation import old-leads.csv --name spring-2026 --dry-run  # check, save nothing
+uv run python -m lead_bot.reactivation import old-leads.csv --name spring-2026 --daily-limit 50
+uv run python -m lead_bot.reactivation status
+```
+
+Read the consent wordings the dry run lists before importing for real: whether a wording covers
+automated texts from this business is for a person (ideally the client's lawyer) to judge.
+
 Every bot text is fixed wording from `text_script.py`. Jev only classifies what the homeowner
 wrote. The writer (OpenAI) drafts an answer only to an off-script question, and the guard
 (Jev checks plus regex backstops) must pass the draft before it is sent; otherwise the
