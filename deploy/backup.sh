@@ -11,8 +11,10 @@
 #    bot writes mid-copy). .backup reads through SQLite itself, so it sees one moment in time
 #    and never blocks the bot's writes.
 # 2. Check the copy (PRAGMA integrity_check) before trusting it.
-# 3. restic uploads the copies, encrypted, to off-server storage and thins old snapshots:
-#    14 daily and 6 monthly are kept.
+# 3. restic uploads the copies, plus each client's .env, client.toml and Google key file (read in
+#    place, so no extra plaintext copy of the keys is made), encrypted, to off-server storage and
+#    thins old snapshots: 14 daily and 6 monthly are kept. A client restored from this needs
+#    nothing else: data, keys and the roofer's facts all come back from one snapshot.
 #
 # One client failing never stops the others; the exit code is non-zero if anything failed, so the
 # systemd timer (deploy step 9) can alert. Run it as the user that owns the data/ folders
@@ -58,9 +60,23 @@ if ! restic cat config >/dev/null 2>&1; then
 fi
 
 echo "== local copies"
+# Files a client needs to run again after the server is lost. They go straight into the encrypted
+# off-server snapshot from where they live; no second plaintext copy of the secrets is made on the
+# server. The Google service-account key exists only once the calendar service account is set up.
+CONFIG_FILES=()
 for client_dir in "$CLIENTS_DIR"/*/; do
   client_dir="${client_dir%/}"
   client="$(basename "$client_dir")"
+  for config_name in .env client.toml; do
+    if [ -f "$client_dir/$config_name" ]; then
+      CONFIG_FILES+=("$client_dir/$config_name")
+    else
+      # A client can't run without these, so a missing one means the folder is wrong or a file was
+      # lost. Say so rather than backing up a client that couldn't be restored.
+      fail "$client: no $config_name at $client_dir/$config_name"
+    fi
+  done
+  [ -f "$client_dir/google-service-account.json" ] && CONFIG_FILES+=("$client_dir/google-service-account.json")
   database="$client_dir/data/lead_bot.db"
   if [ ! -f "$database" ]; then
     # A client folder with no database means it never started or the folder is wrong. Either way
@@ -97,12 +113,17 @@ if [ "$succeeded" -eq 0 ]; then
 else
   # Uploading what exists even when one client failed: the healthy clients still get their
   # backup tonight. The failure is in the exit code.
-  if restic backup --host "$BACKUP_HOST" --tag nightly --quiet "$BACKUP_DIR"; then
-    echo "ok      uploaded $BACKUP_DIR"
+  # The config files ride in the same snapshot as the databases, so one restore point holds
+  # everything a client needs. ${CONFIG_FILES[@]+...} keeps an empty list from tripping `set -u`.
+  if restic backup --host "$BACKUP_HOST" --tag nightly --quiet "$BACKUP_DIR" ${CONFIG_FILES[@]+"${CONFIG_FILES[@]}"}; then
+    echo "ok      uploaded $BACKUP_DIR and ${#CONFIG_FILES[@]} config file(s)"
   else
     fail "restic backup failed"
   fi
-  if restic forget --host "$BACKUP_HOST" --keep-daily "$KEEP_DAILY" --keep-monthly "$KEEP_MONTHLY" --prune --quiet; then
+  # --group-by host: restic's default also groups by the set of paths, and the path set changes
+  # whenever a client is added or removed. The old group would then stop getting new snapshots, and
+  # because "daily" and "monthly" count only days that HAVE snapshots, it would never be thinned.
+  if restic forget --host "$BACKUP_HOST" --group-by host --keep-daily "$KEEP_DAILY" --keep-monthly "$KEEP_MONTHLY" --prune --quiet; then
     echo "ok      thinned old snapshots (keep $KEEP_DAILY daily, $KEEP_MONTHLY monthly)"
   else
     fail "restic forget/prune failed"

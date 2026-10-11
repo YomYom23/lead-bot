@@ -20,14 +20,25 @@ scratch="${2:-$(mktemp -d)}"
 : "${RESTIC_REPOSITORY:?set RESTIC_REPOSITORY}"
 
 mkdir -p "$scratch"
-# restic stores each file under its original absolute path, so ask for that path.
+# restic stores each file under its original absolute path, so ask for those paths. The client's
+# .env and client.toml come from the same snapshot as the database.
 wanted="$ROOT/backups/$client/lead_bot.db"
-if ! restic restore latest --host "$BACKUP_HOST" --target "$scratch" --include "$wanted" --quiet; then
+if ! restic restore latest --host "$BACKUP_HOST" --target "$scratch" --include "$wanted" \
+  --include "$ROOT/clients/$client/.env" --include "$ROOT/clients/$client/client.toml" --quiet; then
   echo "FAILED  restic could not restore $wanted (is there a snapshot for this client?)" >&2
   exit 1
 fi
 restored="$scratch$wanted"
 [ -f "$restored" ] || { echo "FAILED  restore finished but $restored is missing" >&2; exit 1; }
+# A snapshot without a client's .env or client.toml can restore the data but not the client: the
+# keys and the roofer's facts are gone. Check they came back and aren't empty, without printing them.
+for config_name in .env client.toml; do
+  restored_config="$scratch$ROOT/clients/$client/$config_name"
+  if [ ! -s "$restored_config" ]; then
+    echo "FAILED  $client: $config_name is missing or empty in the snapshot" >&2
+    exit 1
+  fi
+done
 
 integrity="$(sqlite3 "$restored" "PRAGMA integrity_check" 2>&1 | head -n 1)"
 if [ "$integrity" != "ok" ]; then
@@ -37,6 +48,8 @@ fi
 
 echo "ok      $client: restored $restored"
 echo "        integrity_check: ok"
+echo "        config files: .env and client.toml restored (contents not shown)"
 echo "        leads: $(sqlite3 "$restored" 'SELECT COUNT(*) FROM leads')"
 echo "        texts: $(sqlite3 "$restored" 'SELECT COUNT(*) FROM texts')"
 echo "        newest lead: $(sqlite3 "$restored" "SELECT COALESCE(datetime(MAX(created_at), 'unixepoch'), 'none') FROM leads") UTC"
+echo "        the scratch folder holds that client's keys now: delete it when you are done ($scratch)"

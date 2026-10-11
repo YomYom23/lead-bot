@@ -108,6 +108,14 @@ docker volume create "$DATA_VOLUME" >/dev/null; docker volume create "$REPO_VOLU
 # A new volume is owned by root; hand it to UID 1000, as VPS prep (step 5) will do for the real one.
 docker run --rm --user root -v "$DATA_VOLUME":/srv/lead-bot -v "$REPO_VOLUME":/repo "$BOT_IMAGE" \
   sh -c 'for c in alpha bravo delta; do mkdir -p /srv/lead-bot/clients/$c/data; done; chown -R 1000:1000 /srv/lead-bot /repo'
+# Each client's keys and facts. The sentinel text stands in for a real secret, so the check can
+# prove it comes back intact and never appears readable in the off-server repository.
+docker run --rm --user root -v "$DATA_VOLUME":/srv/lead-bot "$BOT_IMAGE" sh -c '
+  for c in alpha bravo delta; do
+    echo "TWILIO_AUTH_TOKEN=LEAD_BOT_CHECK_SECRET_SENTINEL_$c" > /srv/lead-bot/clients/$c/.env
+    echo "[business]  # LEAD_BOT_CHECK_FACTS_SENTINEL_$c" > /srv/lead-bot/clients/$c/client.toml
+    chown 1000:1000 /srv/lead-bot/clients/$c/.env /srv/lead-bot/clients/$c/client.toml; chmod 600 /srv/lead-bot/clients/$c/.env
+  done'
 for client in alpha bravo; do fill "$client" 0 0 0 >/dev/null; done   # schema only (this puts the file in WAL mode)
 fill alpha 0 10 0 >/dev/null
 fill delta 0 30 0 >/dev/null
@@ -153,13 +161,23 @@ fi
 expect_equal "alpha restore passes its integrity check" "$(echo "$restored_alpha" | grep -c 'integrity_check: ok')" 1
 expect_equal "bravo restored every lead, including those only in the -wal file" "$(leads_in "$restored_bravo")" 25
 expect_equal "delta restored all its leads" "$(leads_in "$restored_delta")" 30
+expect_in "restore-check reports the config files came back" "$restored_bravo" "config files: .env and client.toml restored"
+expect_equal "a restored .env is byte-identical to the live one" "$(runner sh -c 'restic restore latest --host lead-bot --target /tmp/cfg --include /srv/lead-bot/clients/bravo/.env --quiet && cmp /tmp/cfg/srv/lead-bot/clients/bravo/.env /srv/lead-bot/clients/bravo/.env && echo same' | tail -n 1)" same
+expect_equal "no plaintext copy of the keys sits in the local backups folder" "$(runner find /srv/lead-bot/backups -name '.env*' -o -name 'client.toml' | wc -l)" 0
+# The repository is on the volume as restic wrote it. Neither a key nor a lead's name may be readable in it.
+expect_equal "the repository holds no readable key, facts or lead data" "$(docker run --rm -v "$REPO_VOLUME":/repo "$BOT_IMAGE" sh -c 'grep -rlF -e LEAD_BOT_CHECK_SECRET_SENTINEL -e LEAD_BOT_CHECK_FACTS_SENTINEL -e "Test Person" /repo | wc -l')" 0
 
 echo "== backup #2: older snapshots are thinned (back-dated ones are injected with restic --time)"
 # Two on the same past day, then one each in the previous two months. keep-daily/keep-monthly must
 # drop the earlier of the same-day pair and keep the rest. (restic counts days and months that HAVE
-# snapshots, not calendar time, so the result doesn't depend on when this check is run.)
-runner sh -c 'for moment in "2026-10-05 02:00:00" "2026-10-05 03:00:00" "2026-09-30 02:00:00" "2026-08-20 02:00:00"; do
-  restic backup --host lead-bot --time "$moment" --quiet /srv/lead-bot/backups; done'
+# snapshots, not calendar time, so the result doesn't depend on when this check is run.) The same-day
+# pair is taken with DIFFERENT path sets, as happens when a client is added between two nights:
+# thinning must still treat them as one history.
+config_paths=""
+for c in alpha bravo delta; do config_paths="$config_paths /srv/lead-bot/clients/$c/.env /srv/lead-bot/clients/$c/client.toml"; done
+runner sh -c "restic backup --host lead-bot --time '2026-10-05 02:00:00' --quiet /srv/lead-bot/backups
+  for moment in '2026-10-05 03:00:00' '2026-09-30 02:00:00' '2026-08-20 02:00:00'; do
+    restic backup --host lead-bot --time \"\$moment\" --quiet /srv/lead-bot/backups $config_paths; done"
 runner bash /deploy/backup.sh >/dev/null 2>&1
 snapshot_times=$(runner restic snapshots --host lead-bot --compact)
 expect_in "the later snapshot of a past day is kept" "$snapshot_times" "2026-10-05 03:00:00"
@@ -176,6 +194,7 @@ runner sh -c "rm -f $(database_of delta)-wal $(database_of delta)-shm; head -c 6
 fixture_check=$(runner sqlite3 "$(database_of delta)" "PRAGMA integrity_check" 2>&1 | head -n 1)
 [ "$fixture_check" != "ok" ] && pass "fixture: delta is now corrupt on disk ($fixture_check)" || fail "fixture: delta still passes integrity_check, the corruption test proves nothing"
 runner mkdir -p /srv/lead-bot/clients/charlie/data
+runner sh -c 'echo "TWILIO_AUTH_TOKEN=LEAD_BOT_CHECK_SECRET_SENTINEL_charlie" > /srv/lead-bot/clients/charlie/.env; echo "[business]" > /srv/lead-bot/clients/charlie/client.toml'
 output=$(runner bash /deploy/backup.sh 2>&1); status=$?
 echo "$output" | sed 's/^/   | /'
 expect_equal "backup exits 1 when any client failed" "$status" 1
@@ -189,10 +208,21 @@ runner bash /deploy/restore-check.sh charlie >/dev/null 2>&1 && fail "restore-ch
 
 echo "== restore-check refuses a corrupt snapshot"
 # Put a corrupt copy into the repository by hand, as if a bad backup had got through.
-runner sh -c "cp $(database_of delta) /srv/lead-bot/backups/delta/lead_bot.db && restic backup --host lead-bot --quiet /srv/lead-bot/backups"
+runner sh -c "cp $(database_of delta) /srv/lead-bot/backups/delta/lead_bot.db && restic backup --host lead-bot --quiet /srv/lead-bot/backups /srv/lead-bot/clients/delta/.env /srv/lead-bot/clients/delta/client.toml"
 output=$(runner bash /deploy/restore-check.sh delta 2>&1); status=$?
 expect_equal "restore-check exits 1 on a corrupt snapshot" "$status" 1
 expect_in "and says why" "$output" "failed its integrity check"
+
+echo "== a client missing its client.toml is reported"
+runner mv /srv/lead-bot/clients/bravo/client.toml /srv/lead-bot/clients/bravo/client.toml.hidden
+output=$(runner bash /deploy/backup.sh 2>&1); status=$?
+runner mv /srv/lead-bot/clients/bravo/client.toml.hidden /srv/lead-bot/clients/bravo/client.toml
+expect_in "the missing client.toml is reported" "$output" "FAILED  bravo: no client.toml"
+expect_equal "and the run exits 1" "$status" 1
+# That run's snapshot is now the newest, and it has no client.toml for bravo: a restore must not pass.
+output=$(runner bash /deploy/restore-check.sh bravo 2>&1); status=$?
+expect_equal "restore-check exits 1 when the newest snapshot lacks the client's client.toml" "$status" 1
+expect_in "and names the missing file" "$output" "client.toml is missing or empty in the snapshot"
 
 echo "== a wrong repository stops the run before anything is written"
 output=$(REPOSITORY_ADDRESS=/nonexistent runner bash /deploy/backup.sh 2>&1); status=$?
