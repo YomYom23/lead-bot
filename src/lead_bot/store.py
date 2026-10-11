@@ -233,6 +233,13 @@ CREATE TABLE IF NOT EXISTS monthly_reports (
     month   TEXT PRIMARY KEY,               -- 'YYYY-MM', the month the report covers
     sent_at REAL NOT NULL
 );
+
+-- When the worker last completed a loop pass (one row), so /health can tell a stopped worker
+-- from a healthy one. The server reads the database either way.
+CREATE TABLE IF NOT EXISTS worker_heartbeat (
+    only_row INTEGER PRIMARY KEY CHECK (only_row = 1),
+    beat_at  REAL NOT NULL
+);
 """
 
 # homeowner         -> a text the homeowner sent us
@@ -1722,6 +1729,20 @@ class Store:
                 "INSERT OR IGNORE INTO monthly_reports (month, sent_at) VALUES (?, ?)",
                 (month, now.timestamp()),
             )
+
+    def record_worker_heartbeat(self, now: datetime) -> None:
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO worker_heartbeat (only_row, beat_at) VALUES (1, ?) "
+                "ON CONFLICT (only_row) DO UPDATE SET beat_at = excluded.beat_at",
+                (now.timestamp(),),
+            )
+
+    def last_worker_heartbeat(self) -> datetime | None:
+        """When the worker last reported in, or None if it never has."""
+        with self._read() as connection:
+            row = connection.execute("SELECT beat_at FROM worker_heartbeat").fetchone()
+        return None if row is None else datetime.fromtimestamp(row["beat_at"], tz=UTC)
 
     def counts(self) -> dict[str, dict[str, int]]:
         """Leads by status, and texts by status in each direction, for /health."""

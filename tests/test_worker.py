@@ -8,7 +8,15 @@ from pathlib import Path
 
 from conftest import DANA_PHONE, make_consent, make_lead, phoenix
 from test_store import add_do_not_call_row_by_hand
-from text_fakes import SETTINGS, Clock, ScriptedJev, make_worker, reply, start_conversation
+from text_fakes import (
+    SETTINGS,
+    Clock,
+    RecordingSender,
+    ScriptedJev,
+    make_worker,
+    reply,
+    start_conversation,
+)
 
 from lead_bot.store import Store
 from lead_bot.text_script import opt_out_confirmation
@@ -161,3 +169,30 @@ def test_a_quiet_conversation_is_handed_off_after_a_day(store: Store) -> None:
     worker.run_once()
     assert store.conversation_result(lead_id) == "stopped_replying"
     assert store.lead_status(lead_id) == "handed_off"
+
+
+def test_every_pass_records_a_heartbeat_even_when_there_is_nothing_to_do(store: Store) -> None:
+    clock = Clock()
+    worker, _ = make_worker(store, ScriptedJev(), clock)
+    assert store.last_worker_heartbeat() is None
+    worker.run_once()
+    assert store.last_worker_heartbeat() == clock()
+
+
+def test_the_heartbeat_keeps_moving_during_a_long_pass(store: Store) -> None:
+    # A pass with many texts to answer or send can outlast /health's two-minute limit, and the
+    # monitor would then report a busy worker as dead. So the beat happens between texts too.
+    clock = Clock()
+    sender = RecordingSender()
+    original_send = sender.send
+
+    def slow_send(phone: str, body: str) -> str:
+        clock.now += timedelta(minutes=3)  # the provider takes its time
+        return original_send(phone, body)
+
+    sender.send = slow_send  # type: ignore[method-assign]
+    worker, _ = make_worker(store, ScriptedJev(), clock, sender=sender)
+    store.add_lead(make_lead(), make_consent(), clock(), SETTINGS.texting_hours)
+    worker.run_once()
+    assert len(sender.sent) == 1
+    assert store.last_worker_heartbeat() == clock()

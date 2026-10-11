@@ -2,7 +2,10 @@
 # The form, submitted through the real FastAPI app with a temp database and a fixed clock.
 from __future__ import annotations
 
-from datetime import datetime
+import sqlite3
+from dataclasses import replace
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 from conftest import BUSINESS_NAME, DANA_PHONE, MONDAY_10AM, PHOENIX, phoenix
@@ -133,8 +136,23 @@ def test_typed_html_is_shown_as_text_not_run(store: Store) -> None:
     assert "&lt;script&gt;" in response.text
 
 
+def test_consent_evidence_records_the_public_address_not_the_internal_one(
+    store: Store, tmp_path: Path
+) -> None:
+    # Behind Caddy the server sees http://lead-bot-<client>-server:8000/leads. The record must
+    # name the page the homeowner actually used, which is PUBLIC_BASE_URL plus the path.
+    public_settings = replace(SETTINGS, public_base_url="https://demo.bot.example.com/")
+    app = create_app(store, public_settings, clock=lambda: MONDAY_10AM)
+    internal_client = TestClient(app, base_url="http://lead-bot-demo-server:8000")
+    internal_client.post("/leads", data=GOOD_FORM)
+    with sqlite3.connect(tmp_path / "leads.db") as connection:
+        recorded_sources = [row[0] for row in connection.execute("SELECT source FROM consents")]
+    assert recorded_sources == ["https://demo.bot.example.com/leads"]
+
+
 def test_health_reports_counts(store: Store) -> None:
     client = client_at(store, MONDAY_10AM)
+    store.record_worker_heartbeat(MONDAY_10AM)
     client.post("/leads", data=GOOD_FORM)
     assert client.get("/health").json() == {
         "ok": True,
@@ -142,3 +160,25 @@ def test_health_reports_counts(store: Store) -> None:
         "texts_in": {},
         "texts_out": {},
     }
+
+
+def test_health_fails_when_the_worker_has_never_reported(store: Store) -> None:
+    response = client_at(store, MONDAY_10AM).get("/health")
+    assert response.status_code == 503
+    assert response.json()["ok"] is False
+    assert response.json()["problem"] == "worker has not reported yet"
+
+
+def test_health_is_ok_while_the_worker_heartbeat_is_fresh(store: Store) -> None:
+    store.record_worker_heartbeat(MONDAY_10AM)
+    # 90 seconds old is under the two-minute limit; 150 seconds is the stale case below.
+    response = client_at(store, MONDAY_10AM + timedelta(seconds=90)).get("/health")
+    assert response.status_code == 200
+
+
+def test_health_fails_when_the_worker_heartbeat_is_stale(store: Store) -> None:
+    store.record_worker_heartbeat(MONDAY_10AM)
+    response = client_at(store, MONDAY_10AM + timedelta(seconds=150)).get("/health")
+    assert response.status_code == 503
+    assert response.json()["ok"] is False
+    assert response.json()["problem"] == "worker heartbeat is 150 seconds old"

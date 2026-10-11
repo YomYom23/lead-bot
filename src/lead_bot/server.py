@@ -9,7 +9,7 @@ WebSocket, and a health check.
   POST /twilio/voice/incoming -> a forwarded call nobody picked up: check, record it, answer with
                                  TwiML that connects it to the relay
   WS   /calls/relay           -> the live call itself (relay.py)
-  GET  /health                -> counts of leads and texts by status
+  GET  /health                -> counts of leads and texts by status; 503 if the worker stopped
 
 Nothing here sends a text. The text handlers record and return at once, because Twilio retries a
 webhook that's slow to answer. Sending and answering texts happen in the worker process
@@ -27,7 +27,7 @@ from string import Template
 from typing import Annotated
 
 from fastapi import FastAPI, Form, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData
 
@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 
 # An empty TwiML reply: "received, send nothing back". The worker sends the answer later.
 EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+
+# /health fails when the worker hasn't written its heartbeat for this long. The worker beats
+# every couple of seconds even when idle, so two minutes means it is stopped or stuck.
+WORKER_HEARTBEAT_LIMIT_SECONDS = 120
 
 # string.Template rather than str.format: the CSS is full of { } braces, which str.format would
 # try to fill in. Template only substitutes $names. Every value put into a page goes through
@@ -197,7 +201,10 @@ def create_app(
             ip_address=request.client.host if request.client else "unknown",
             forwarded_for=request.headers.get("x-forwarded-for"),
             user_agent=request.headers.get("user-agent", "")[:500],
-            source=str(request.url),
+            # The public address, not request.url: behind a proxy request.url is the internal
+            # one (http://lead-bot-<client>-server:8000/leads), which proves nothing about the
+            # page the homeowner saw. Built the same way as the Twilio signed URL below.
+            source=settings.public_base_url.rstrip("/") + request.url.path,
         )
         submitted_at = clock()
         added = store.add_lead(new_lead, evidence, submitted_at, settings.texting_hours)
@@ -208,8 +215,18 @@ def create_app(
         )
 
     @app.get("/health")
-    def health() -> dict[str, object]:
-        return {"ok": True, **store.counts()}
+    def health() -> Response:
+        # The server can read the database whether or not the worker is running, so counts
+        # alone would say "ok" for a dead worker. The worker's heartbeat is what proves it lives.
+        last_beat = store.last_worker_heartbeat()
+        if last_beat is None:
+            return _health_response(503, {"ok": False, "problem": "worker has not reported yet"})
+        seconds_old = int((clock() - last_beat).total_seconds())
+        if seconds_old > WORKER_HEARTBEAT_LIMIT_SECONDS:
+            return _health_response(
+                503, {"ok": False, "problem": f"worker heartbeat is {seconds_old} seconds old"}
+            )
+        return _health_response(200, {"ok": True, **store.counts()})
 
     async def checked_twilio_form(request: Request, path: str) -> FormData | Response:
         """The posted form if the request really came from Twilio, otherwise the error to return."""
@@ -292,6 +309,10 @@ def create_app(
 
 def twiml_response() -> Response:
     return Response(EMPTY_TWIML, media_type="text/xml")
+
+
+def _health_response(status_code: int, body: dict[str, object]) -> JSONResponse:
+    return JSONResponse(body, status_code=status_code)
 
 
 def _thanks_body(added: AddedLead | None, settings: BusinessSettings, phone_shown: str, now: datetime) -> str:

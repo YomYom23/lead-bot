@@ -158,17 +158,27 @@ class Worker:
             logger.warning("after restart: %d incoming texts requeued, %d sends unknown", requeued, unknown)
 
     def run_once(self) -> PassSummary:
+        # A beat before each piece of work, not once per pass: answering or sending many texts
+        # can take longer than /health's limit, and a busy worker must not look dead.
+        self._beat()
         answered = 0
         while self.answer_next_incoming():
             answered += 1
+            self._beat()
         # Before queuing openings, so a contact started now gets its first text in this pass.
         self._store.start_campaign_contacts(self._clock(), self.hours)
         queued = self.queue_due_openings()
         closed = len(self._store.close_quiet_conversations(self._clock(), QUIET_CONVERSATION_LIMIT))
         sent = 0
+        self._beat()
         while self.send_next_queued():
             sent += 1
+            self._beat()
         return PassSummary(answered, queued, closed, sent)
+
+    def _beat(self) -> None:
+        """Tell /health the worker is alive (the server reads this from the shared database)."""
+        self._store.record_worker_heartbeat(self._clock())
 
     def run_forever(self) -> None:
         self.recover_after_restart()
