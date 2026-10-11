@@ -1,0 +1,12 @@
+# lead-bot/deploy/caddy/Caddyfile
+# The only fixed part of Caddy's configuration. Each client's site lives in its own file under
+# sites/ (made from deploy/Caddyfile.template), so adding or removing a client never edits
+# another client's configuration.
+import /etc/caddy/sites/*.caddy
+
+# Any host name that isn't a client's gets a plain 404. Without this Caddy answers 200 with an
+# empty body, which makes a mistyped or guessed name look like a working site to scanners and to
+# the uptime monitor. (Over HTTPS an unknown name never gets a certificate, so the handshake fails.)
+:80 {
+	respond "Not found" 404
+}

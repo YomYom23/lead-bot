@@ -1,0 +1,44 @@
+# lead-bot/deploy/caddy/compose.yaml
+# Caddy: the one container that publishes ports to the internet. It terminates TLS and forwards
+# each client's host name to that client's server container over the lead-bot-proxy network.
+#
+#   CADDY_DIR=/srv/lead-bot/caddy docker compose -p lead-bot-caddy -f deploy/caddy/compose.yaml up -d
+#
+# CADDY_DIR holds Caddyfile (copied from deploy/caddy/Caddyfile) and sites/<client>.caddy.
+# Reload after adding a client: docker exec lead-bot-caddy caddy reload --config /etc/caddy/Caddyfile
+#
+# CADDY_HTTP_PORT / CADDY_HTTPS_PORT default to 80 / 443; a local test moves them out of the way.
+
+name: lead-bot-caddy
+
+services:
+  caddy:
+    image: caddy:2
+    container_name: lead-bot-caddy
+    restart: unless-stopped
+    ports:
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+    volumes:
+      - ${CADDY_DIR:?set CADDY_DIR}/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${CADDY_DIR}/sites:/etc/caddy/sites:ro
+      # Certificates and the account key. Losing them means reissuing every certificate, and
+      # Let's Encrypt limits how often that can happen, so they live in a named volume.
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - proxy
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  # Owned here; every client project joins it as an external network.
+  proxy:
+    name: lead-bot-proxy

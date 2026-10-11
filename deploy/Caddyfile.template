@@ -1,0 +1,13 @@
+# lead-bot/deploy/Caddyfile.template
+# One client's site. new-client.sh (deploy step 10) fills in the two placeholders and writes the
+# result to /srv/lead-bot/caddy/sites/<client>.caddy, which the main Caddyfile imports.
+#
+#   @CLIENT@        the client's short name (matches CLIENT in compose.template.yaml)
+#   @SITE_ADDRESS@  the public host name, e.g. acme.bot.example.com. Caddy fetches and renews its
+#                   TLS certificate by itself. A local test uses http://acme.localhost:80, which
+#                   turns HTTPS off.
+@SITE_ADDRESS@ {
+	# reverse_proxy carries the call-relay WebSocket (/calls/relay) with no extra settings, and
+	# sets X-Forwarded-For to the visitor's address, which the consent record keeps.
+	reverse_proxy lead-bot-@CLIENT@-server:8000
+}

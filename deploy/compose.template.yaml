@@ -1,0 +1,86 @@
+# lead-bot/deploy/compose.template.yaml
+# One client's pair of containers: the web server and the worker, from the same image. Run it
+# once per client as its own compose project, so clients never share a container, a database
+# or a restart:
+#
+#   CLIENT=acme IMAGE_TAG=<git sha> CLIENT_DIR=/srv/lead-bot/clients/acme WORKER_FLAGS=--send \
+#     docker compose -p lead-bot-acme -f deploy/compose.template.yaml up -d
+#
+# Variables (all required; compose stops with a message naming any that's missing):
+#   CLIENT        short name, lowercase letters/digits/dashes. Becomes the network name Caddy
+#                 proxies to: lead-bot-<CLIENT>-server.
+#   IMAGE_TAG     which build this client runs (lead-bot:<IMAGE_TAG>). Each client pins its own,
+#                 so an update goes to one client first and a rollback is a retag.
+#   CLIENT_DIR    the client's folder: .env (chmod 600), client.toml, data/. Absolute path.
+#   WORKER_FLAGS  "--send" in production. Empty means a dry run that prints texts instead of
+#                 sending. No default on purpose: a forgotten variable must never silently
+#                 decide whether real texts go out.
+#
+# Only the Caddy project publishes ports. These containers are reachable only over Docker
+# networks, so nothing here is exposed to the internet directly.
+
+name: lead-bot-${CLIENT:?set CLIENT}
+
+x-common: &common
+  image: lead-bot:${IMAGE_TAG:?set IMAGE_TAG}
+  restart: unless-stopped
+  # tini as PID 1: python as PID 1 ignores SIGTERM, so `docker stop` would wait ten seconds and
+  # then kill the process mid-write.
+  init: true
+  # The client's secrets (Twilio, SMTP, model keys, PUBLIC_BASE_URL) come in as environment
+  # variables from the .env on the VPS. The image holds none of them.
+  env_file: ${CLIENT_DIR:?set CLIENT_DIR}/.env
+  environment:
+    CLIENT_CONFIG_PATH: /config/client.toml
+    # LEAD_BOT_DB_PATH=/data/lead_bot.db is set in the image.
+  volumes:
+    - type: bind
+      source: ${CLIENT_DIR}/client.toml
+      target: /config/client.toml
+      read_only: true
+    # A bind mount on the host's own disk, not a network filesystem: both containers then share
+    # one kernel, which is what makes SQLite's WAL locking between them safe. The folder must be
+    # owned by UID 1000, the user the image runs as.
+    - type: bind
+      source: ${CLIENT_DIR}/data
+      target: /data
+  # Logs would otherwise grow without limit on the VPS disk.
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+services:
+  server:
+    <<: *common
+    networks:
+      default: {}
+      proxy:
+        # The name Caddy's site block for this client points at.
+        aliases:
+          - lead-bot-${CLIENT}-server
+    # /health is 503 when the worker's heartbeat is stale, so `docker ps` shows "unhealthy" for a
+    # dead worker too. (Docker only reports this; the uptime monitor is what alerts.)
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    <<: *common
+    # Shell-style string on purpose: compose splits it into words, so an empty WORKER_FLAGS
+    # leaves just `python -m lead_bot.worker`.
+    command: python -m lead_bot.worker ${WORKER_FLAGS?set WORKER_FLAGS (--send, or empty for a dry run)}
+
+networks:
+  # Created by the Caddy project (deploy/caddy/compose.yaml); this project only joins it.
+  proxy:
+    name: lead-bot-proxy
+    external: true
