@@ -2,7 +2,7 @@
 # lead-bot/deploy/check-backup.sh
 # The deployment step 4 check: backs up real lead-bot databases the way the VPS will, restores
 # them, and proves the restored data is complete and intact. Runs backup.sh and restore-check.sh
-# inside ubuntu:24.04 (the VPS's OS, with its apt versions of sqlite3 and restic) as UID 1000,
+# inside ubuntu:26.04 (the VPS's OS, with its apt versions of sqlite3 and restic) as UID 1000,
 # against a Docker volume that stands in for /srv/lead-bot. The restic repository is a second
 # volume standing in for off-server storage. Everything it makes is removed on exit.
 #
@@ -25,7 +25,8 @@ WORK="${TMPDIR:-/tmp}/lead-bot-backup-check"
 DATA_VOLUME=leadbot-bk-data
 REPO_VOLUME=leadbot-bk-repo
 BOT_IMAGE=lead-bot:bkcheck
-RUNNER_IMAGE=lead-bot-backup-check:ubuntu
+RUNNER_BASE="${RUNNER_BASE:-ubuntu:26.04}"   # the VPS's OS (checked on 2026-10-11); ubuntu:24.04 also passes
+RUNNER_IMAGE="lead-bot-backup-check:${RUNNER_BASE//[:\/]/-}"
 FAILURES=0
 
 pass() { echo "  ok    $1"; }
@@ -95,10 +96,10 @@ for number in range(first, last):
     time.sleep(delay)
 PY
 
-echo "== build the bot image and the VPS-like runner (ubuntu 24.04 + apt sqlite3 and restic)"
+echo "== build the bot image and the VPS-like runner ($RUNNER_BASE + apt sqlite3 and restic)"
 docker build -q -t "$BOT_IMAGE" "$REPO" >/dev/null || { echo "bot image build failed"; exit 1; }
 if ! docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1; then
-  printf 'FROM ubuntu:24.04\nRUN apt-get update -qq && apt-get install -y -qq sqlite3 restic ca-certificates >/dev/null && rm -rf /var/lib/apt/lists/*\n' \
+  printf 'FROM %s\nRUN apt-get update -qq && apt-get install -y -qq sqlite3 restic ca-certificates >/dev/null && rm -rf /var/lib/apt/lists/*\n' "$RUNNER_BASE" \
     | docker build -q -t "$RUNNER_IMAGE" - >/dev/null || { echo "runner image build failed"; exit 1; }
 fi
 runner sh -c 'echo "   runner: sqlite3 $(sqlite3 --version | cut -d" " -f1), $(restic version | cut -d" " -f1,2)"'
