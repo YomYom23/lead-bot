@@ -13,6 +13,7 @@ from text_fakes import (
     Clock,
     RecordingSender,
     ScriptedJev,
+    make_services,
     make_worker,
     reply,
     start_conversation,
@@ -20,7 +21,10 @@ from text_fakes import (
 
 from lead_bot.store import Store
 from lead_bot.text_script import opt_out_confirmation
-from lead_bot.worker import OPT_OUT_CONFIRMATION_LIMIT
+from lead_bot.worker import OPT_OUT_CONFIRMATION_LIMIT, PrintingSender, Worker
+
+# Built from parts: 555-0100 to 555-0199 are the numbers reserved for fiction.
+SECOND_HOMEOWNER_PHONE = "+1" + "602" + "555" + "0143"
 
 
 def text_counts(store: Store) -> dict[str, int]:
@@ -196,3 +200,23 @@ def test_the_heartbeat_keeps_moving_during_a_long_pass(store: Store) -> None:
     worker.run_once()
     assert len(sender.sent) == 1
     assert store.last_worker_heartbeat() == clock()
+
+
+def test_dry_run_texts_get_different_provider_ids_after_a_restart() -> None:
+    # The dry-run sender used to number its texts from 1 in every new process. After a restart the
+    # first text got the id the previous run's first text already had.
+    first_run_id = PrintingSender().send(DANA_PHONE, "hello")
+    restarted_run_id = PrintingSender().send(DANA_PHONE, "hello")
+    assert first_run_id != restarted_run_id
+
+
+def test_a_restarted_dry_run_worker_keeps_sending_instead_of_crashing(store: Store) -> None:
+    # The database refuses a repeated provider id, so the repeated dry-run id crashed the worker in
+    # the middle of a send, and the restart then flagged that text "unknown" with an owner alert.
+    clock = Clock()
+    for phone in (DANA_PHONE, SECOND_HOMEOWNER_PHONE):
+        store.add_lead(make_lead(phone), make_consent(), clock(), SETTINGS.texting_hours)
+        # A new worker with a new sender is what a restart gives you.
+        worker = Worker(store, SETTINGS, make_services(ScriptedJev()), PrintingSender(), clock=clock)
+        worker.run_once()
+    assert text_counts(store) == {"sent": 2}

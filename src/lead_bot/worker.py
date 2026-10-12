@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import secrets
 import threading
 import time
 from collections.abc import Callable
@@ -103,12 +104,17 @@ class PrintingSender:
 
     def __init__(self) -> None:
         self._count = 0
+        # A random tag for this run of the worker. The count alone restarts at 1 in every new
+        # process, so after a restart the first text got the id the previous run's first text
+        # already had. The database requires provider ids to be unique, so that crashed the worker
+        # in the middle of a send. Real senders return the provider's own unique message id.
+        self._run_tag = secrets.token_hex(4)
 
     def send(self, phone: str, body: str) -> str:
         self._count += 1
         segments = segment_count(body)
         print(f"\n[text to {phone}, {segments} segment{'s' if segments != 1 else ''}]\n{body}\n")
-        return f"DRYRUN{self._count}"
+        return f"DRYRUN-{self._run_tag}-{self._count}"
 
 
 @dataclass(frozen=True)
