@@ -137,6 +137,25 @@ expect_equal "a lead is accepted before the update" "$post" 200
 expect_equal "it is in the database" "$(live_leads)" 1
 output=$(update demo "$SHA_TAG"); expect_in "running update.sh again with the same tag does nothing" "$output" "already healthy"
 
+echo "== --restart: a changed .env needs new containers even on the same image"
+echo "CHECK_RESTART_MARKER=yes" >> "$ROOT/clients/demo/.env"
+container_before=$(server_container)
+expect_equal "before the restart the container does not know the new setting" "$(docker exec "$container_before" printenv CHECK_RESTART_MARKER 2>/dev/null)" ""
+output=$(update demo --restart); status=$?
+echo "$output" | sed 's/^/   | /'
+expect_equal "restart succeeds" "$status" 0
+[ "$(server_container)" != "$container_before" ] && pass "the server container was replaced" || fail "the server container is the same one"
+expect_equal "and it sees the changed .env" "$(docker exec "$(server_container)" printenv CHECK_RESTART_MARKER 2>/dev/null)" yes
+expect_equal "still on the same image" "$(server_image)" "$V1"
+expect_equal "the lead survived the restart" "$(live_leads)" 1
+expect_equal "deploy.env is unchanged by a restart" "$(deploy_setting IMAGE_TAG)/$(deploy_setting PREVIOUS_IMAGE_TAG)" "$SHA_TAG/"
+# Compose recreates containers by itself when .env changed, so the case above does not need
+# --force-recreate. A restart with NOTHING changed does: that is what makes --restart a restart.
+container_before=$(server_container)
+output=$(update demo --restart); status=$?
+expect_equal "a restart with nothing changed succeeds" "$status" 0
+[ "$(server_container)" != "$container_before" ] && pass "and still replaces the containers" || fail "a restart with nothing changed left the same containers running"
+
 echo "== update to v2"
 v1_id=$(server_image_id)
 output=$(update demo check-v2); status=$?

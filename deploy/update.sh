@@ -4,6 +4,7 @@
 #
 #   bash deploy/update.sh <client> <image tag>     e.g. update.sh acme 3f9c2a1b7e
 #   bash deploy/update.sh <client> --rollback      go back to the tag it ran before
+#   bash deploy/update.sh <client> --restart       same image, new containers: picks up an edited .env
 #
 # Tags come from deploy/build-image.sh (lead-bot:<short sha>). Each client pins its own, which is
 # how one client runs the new build first and the rest follow once it looks right.
@@ -24,7 +25,7 @@ set -u
 DEPLOY_DIR="$(cd "$(dirname "$0")" && { pwd -W 2>/dev/null || pwd; })"
 ROOT="${LEAD_BOT_ROOT:-/srv/lead-bot}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-90}"
-usage() { echo "usage: update.sh <client> <image tag | --rollback>" >&2; exit 2; }
+usage() { echo "usage: update.sh <client> <image tag | --rollback | --restart>" >&2; exit 2; }
 die() { echo "update.sh: $1" >&2; exit 1; }
 
 [ $# -eq 2 ] || usage
@@ -39,9 +40,15 @@ read_setting() { grep -E "^$1=" "$deploy_env" | head -n 1 | cut -d= -f2-; }
 current_tag="$(read_setting IMAGE_TAG)"
 previous_tag="$(read_setting PREVIOUS_IMAGE_TAG)"
 
+force_recreate=""
 if [ "$requested" = "--rollback" ]; then
   [ -n "$previous_tag" ] || die "'$client' has no previous tag to go back to"
   new_tag="$previous_tag"
+elif [ "$requested" = "--restart" ]; then
+  # Containers read .env only when they are created, so a changed .env (a new key, a new
+  # PUBLIC_BASE_URL) needs them recreated even though the image is the same.
+  [ -n "$current_tag" ] || die "'$client' has never been started; start it with an image tag instead"
+  new_tag="$current_tag"; force_recreate="--force-recreate"
 else
   new_tag="$requested"
 fi
@@ -82,12 +89,12 @@ write_tags() { # write_tags <IMAGE_TAG> <PREVIOUS_IMAGE_TAG>: rewrite deploy.env
 }
 
 started_at=$SECONDS
-if [ "$new_tag" = "$current_tag" ] && wait_until_healthy "$new_tag"; then
+if [ -z "$force_recreate" ] && [ "$new_tag" = "$current_tag" ] && wait_until_healthy "$new_tag"; then
   echo "'$client' is already healthy on lead-bot:$new_tag; nothing to do"; exit 0
 fi
 
-echo "== $client: ${current_tag:-(not running)} -> $new_tag"
-compose "$new_tag" up -d --remove-orphans >/dev/null 2>&1 || die "docker compose could not start lead-bot:$new_tag (no change recorded)"
+echo "== $client: ${current_tag:-(not running)} -> $new_tag${force_recreate:+ (restart)}"
+compose "$new_tag" up -d --remove-orphans $force_recreate >/dev/null 2>&1 || die "docker compose could not start lead-bot:$new_tag (no change recorded)"
 
 if wait_until_healthy "$new_tag"; then
   if [ "$new_tag" != "$current_tag" ]; then write_tags "$new_tag" "$current_tag"; fi
@@ -106,6 +113,10 @@ if [ -n "$current_tag" ] && [ "$current_tag" != "$new_tag" ]; then
   else
     echo "FAILED  $client is NOT healthy on lead-bot:$current_tag either: look at 'docker logs' and the .env" >&2
   fi
+elif [ -n "$force_recreate" ]; then
+  # The image did not change, so there is nothing to roll back to: the most likely cause is the
+  # .env that was just edited. Leave the containers as they are for inspection.
+  echo "the restart did not come up healthy; check the .env you just changed ('docker logs lead-bot-$client-server-1')" >&2
 else
   # A first start that fails: stop the containers so they don't restart-loop. Data is untouched.
   compose "$new_tag" stop >/dev/null 2>&1
