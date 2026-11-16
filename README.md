@@ -1,19 +1,25 @@
 # lead-bot
 
 Answers a roofing company's web leads by text message: an AI assistant texts the homeowner,
-asks four questions, and books a free inspection on the company's Google Calendar. A practice
-build of the "one-industry inbound response and follow-up" plan in the AI Lead Response
-research paper.
+asks four questions, and books a free inspection on the company's Google Calendar. It also
+answers the calls the office missed, texts a client's old leads in reactivation campaigns,
+alerts the owner by email and text, and emails a monthly results report.
 
-The voice-call version (phases 1-3) is kept at the git tag `voice-final`.
+The first, call-only version is kept at the git tag `voice-final`; missed-call voice was
+rebuilt on top of the texting bot.
 
 ## Status
 
-| Phase | What | Status |
+| Part | What | Status |
 | --- | --- | --- |
-| 1 | Texting without Twilio: conversation, reminders, opt-out, simulator, ~50 scenarios | done (dry run) |
-| 2 | Twilio: incoming-text webhook, sending, delivery status, Virtual Phone test | built; Virtual Phone test next |
-| 3 | Real phones, after toll-free verification is approved | |
+| Texting | conversation, reminders, opt-out, booking, simulator, 64 scenarios | done |
+| Twilio texts | incoming-text webhook, sending, delivery status | built; Virtual Phone test next |
+| Owner alerts | email, plus text for urgent alerts and new bookings | done |
+| Reactivation | old-lead campaigns with per-contact consent proof | done |
+| Missed-call voice | ConversationRelay, booking or a message, 22 call scenarios | done (simulator) |
+| Monthly report | last month's results emailed on the 1st | done |
+| Deployment | Docker image, per-client compose and Caddy, nightly encrypted backups, update with rollback | built and checked locally; not live yet |
+| Real phones | after toll-free verification is approved | waiting |
 
 The worker prints each text unless it's started with `--send`.
 
