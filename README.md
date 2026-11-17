@@ -4,7 +4,7 @@ Answers a roofing company's web leads by text message. Within seconds of the for
 
 Python · FastAPI · Twilio SMS and ConversationRelay · TypeSafe Jev · OpenAI · Google Calendar · SQLite
 
-431 tests, ruff and mypy clean. 64 scripted text conversations and 22 scripted calls pass offline; scripted replies take a median 0.14 seconds.
+431 tests, ruff and mypy clean. 67 scripted text conversations and 24 scripted calls pass against the live models; of 26 tricky texts, none got a price, insurance talk or a promise back.
 
 ![A simulator run: the homeowner asks about insurance, reports a leak and books a time (fictional lead and company)](media/demo.gif)
 
@@ -77,19 +77,23 @@ An active leak, a request for a person, a question the bot couldn't answer, a ho
 
 ## Results
 
-A live run with Jev and the OpenAI writer, before reactivation and missed-call voice were added:
+One live run on 17 Nov 2026, with the real Jev model and the OpenAI writer: 67 of 67 text conversations and 24 of 24 missed calls passed.
 
-| Category | Run | Passed |
-| --- | --- | --- |
-| Booking | 15 | 15 |
-| Adversarial | 12 | 12 |
-| Hand-off to a person | 9 | 9 |
-| Writer answers | 8 | 8 |
-| Opt-out | 8 | 8 |
-| Fixed answers | 5 | 5 |
-| No reply | 3 | 3 |
+The interesting part is where the 26 tricky texts were stopped: price fishing, insurance and adjuster questions, guarantees, discounts, warranties, a prompt injection, flirting and roofing advice.
 
-The current 64 text and 22 call scenarios all pass with offline keyword stand-ins for Jev and no writer. All 431 tests run offline, with Twilio, Jev, OpenAI, SMTP and the calendar faked.
+| Where it stopped | Texts |
+| --- | --- |
+| Fixed reply from code, no model wording | 15 |
+| Writer answered from the facts, guard passed it | 5 |
+| Writer found no answer in the facts, handed to a person | 6 |
+| Unsafe draft caught by the guard | 0 |
+| Price, insurance or promise texted to the homeowner | 0 |
+
+Most of the risk never reaches a model: prices, insurance and flirting get fixed replies from code. Every answer the writer sent matched `client.example.toml`, and when the facts had no answer it said so instead of guessing, so in this run the guard had nothing to catch. Its checks are tested offline against drafts that break each rule. 25 conversations list phrases that must never be sent (dollar amounts, "covered", "guarantee" and so on), and none were.
+
+Scripted replies took a median 0.22 seconds and drafted, guarded replies 1.07 seconds, before Twilio's delivery. Each run writes every transcript to `scenarios/report.md` and `scenarios/call-report.md`.
+
+All 431 tests run offline, with Twilio, Jev, OpenAI, SMTP and the calendar faked.
 
 Texts to real US numbers wait on Twilio toll-free verification, so Twilio has only been tested with its Virtual Phone.
 
