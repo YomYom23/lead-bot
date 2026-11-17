@@ -19,7 +19,7 @@ from .timing import TextingHours
 
 DEFAULT_TIMEZONE = "America/Phoenix"
 
-# Where the server can be reached. Locally that's uvicorn's default address. On the VPS it's the
+# Where the server can be reached. Locally that's uvicorn's default address. On a server it's the
 # public https:// address Twilio delivers incoming texts to.
 DEFAULT_PUBLIC_BASE_URL = "http://127.0.0.1:8000"
 

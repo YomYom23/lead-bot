@@ -9,7 +9,7 @@ will warn that the app isn't verified; continue past it. The sign-in is saved to
 google_token.json (or GOOGLE_TOKEN_PATH), which the call server reads.
 
 Run it again whenever the call server says "sign in to Google again". In Testing that's every 7
-days. The server never opens a browser itself, so on a VPS: run this on your own computer and
+days. The server never opens a browser itself, so on a remote server: run this on your own computer and
 copy google_token.json across.
 """
 

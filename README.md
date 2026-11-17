@@ -1,203 +1,148 @@
-# lead-bot
+# Lead Bot
 
-Answers a roofing company's web leads by text message: an AI assistant texts the homeowner,
-asks four questions, and books a free inspection on the company's Google Calendar. It also
-answers the calls the office missed, texts a client's old leads in reactivation campaigns,
-alerts the owner by email and text, and emails a monthly results report.
+Answers a roofing company's web leads by text message. Within seconds of the form being sent, it texts the homeowner, asks four questions and books a free inspection on the company's Google Calendar. It also answers calls the office missed, texts a company's old leads in small daily campaigns, alerts the owner by email and text when a person is needed, and emails a monthly results report.
 
-The first, call-only version is kept at the git tag `voice-final`; missed-call voice was
-rebuilt on top of the texting bot.
+Python · FastAPI · Twilio SMS and ConversationRelay · TypeSafe Jev · OpenAI · Google Calendar · SQLite
 
-## Status
+431 tests, ruff and mypy clean. 64 scripted text conversations and 22 scripted calls pass offline; scripted replies take a median 0.14 seconds.
 
-| Part | What | Status |
+![A simulator run: the homeowner asks about insurance, reports a leak and books a time (fictional lead and company)](media/demo.gif)
+
+```bash
+uv run python -m lead_bot.simulate --offline   # you are the homeowner, texting the bot
+```
+
+## Why I built it
+
+Roofers lose leads by replying hours late, and the first company to answer usually gets the job. A bot that replies instantly is easy to build. The hard part is one that is safe to let loose on the public: it must never quote a price, never talk about insurance (in roofing that can count as unlicensed public adjusting), never claim a booking it didn't make, and be able to show that each person agreed to be texted. I wanted to find out how much of that can be enforced in code instead of asked for in a prompt.
+
+## What a conversation looks like
+
+1. The homeowner fills in the form. The server saves the lead together with the exact consent wording they saw, and schedules the first text inside the legal texting window.
+2. The bot introduces itself as an automated assistant and confirms the address.
+3. It asks whether water is coming in, whether there's an insurance claim, and whether they own the home. "Yes, it's dripping into the bedroom" raises an urgent alert for the owner.
+4. It offers three open inspection times from the calendar and books the one picked, by number or in words.
+5. Quiet leads get reminders at 2 hours, 1 day and 3 days, then go to the owner. "Please stop texting me", in any words, gets one confirmation and a place on the do-not-call list.
+
+Missed calls follow the same steps by voice: the business's line forwards unanswered calls to the bot, which books an inspection or takes a message, and every call ends with an owner alert and the transcript.
+
+## How it's built
+
+```mermaid
+flowchart LR
+    F[web form] --> SV[server]
+    T[Twilio webhooks] --> SV
+    SV --> DB[(SQLite)]
+    DB --> W[worker]
+    W --> J[Jev reads the reply]
+    J --> SC[fixed script]
+    SC -- off-script question --> WR[writer] --> G{guard}
+    G -- pass --> OUT[text out]
+    G -- fail --> FX[fixed hand-off text] --> OUT
+    SC --> OUT
+    SC --> CAL[Google Calendar]
+    W --> AL[owner alerts<br/>email + text]
+    C[missed call] --> CR[ConversationRelay<br/>WebSocket] --> SC
+```
+
+Two processes share one SQLite file. The server takes the form and Twilio's webhooks, checks each webhook's signature, saves it and answers at once; it never sends. The worker does everything else: it answers, schedules, sends, books and alerts.
+
+## Design decisions
+
+### The bot's words are fixed, and the model only reads
+
+Every text the bot sends comes from `text_script.py`. Jev's job is to classify what the homeowner wrote: yes or no, a time choice, a request for a person, a question. The script then picks the next fixed line. A model writes words only for an off-script question, and only through the guard.
+
+### A draft is sent only after the guard passes it
+
+When a homeowner asks something the script doesn't cover, the writer (OpenAI) drafts an answer from the business's facts in `client.toml`. The guard then asks Jev whether the draft talks insurance, states a price, promises anything, states a fact that isn't in the facts, claims a booking, leaks its instructions or is off-brand, and blocks at a 0.3 probability. Plain-code backstops for insurance talk, prices and a follow-up promised in the writer's own words run as well, so they still hold if Jev scores a bad draft too low. Any failure sends the fixed "I'll pass that question to our team" text and alerts the owner. A blocked draft costs one text; a wrong one can't be unsent.
+
+### Consent is stored as evidence, not a checkbox
+
+Each lead records the exact consent wording the person saw and the address of the page they used, which is the public address, not the internal one the server sees behind a proxy. Old-lead campaigns refuse any contact without a consent date, source and wording. Texting hours and their legal limits sit in `timing.py`, with the rule they come from (47 CFR 64.1200) cited in the comments.
+
+### Opt-outs are caught before the model sees them
+
+A bare STOP is left to Twilio, which blocks the number and confirms. "Please stop texting me" in any other words is caught by code before Jev, and gets exactly one confirmation. Either way the number goes on the bot's own do-not-call list, and nothing is sent to it again.
+
+### A person is pulled in whenever it matters
+
+An active leak, a request for a person, a question the bot couldn't answer, a homeowner who wants to move their booking, or a text Twilio couldn't deliver each raises an owner alert, emailed with the lead's details, answers and the whole conversation. The urgent ones are also texted to the owner. A failed email is retried, never dropped, and `worker --send` won't start without alert email, because the bot tells homeowners things like "I'll flag this as urgent for our team".
+
+## Things that broke
+
+- **Saturdays.** Given only "Monday to Friday", the writer answered "do you do Saturdays?" with "not in my facts" and passed it to the team. The facts it gets now name the closed days, and the Saturday answer was right in 8 of 9 live tries; the miss fell back safely to the team line with an owner alert.
+- **Gmail's hidden refusal.** A wrong app password came back from `smtplib.login()` as "connection unexpectedly closed", hiding Gmail's real 535 error. The mailer now logs in with one explicit method, so the refusal shows.
+- **A crash after every restart.** The dry-run sender numbered its fake message ids from 1 in every new process. After a restart the first text reused an id, the database's uniqueness rule refused it, and the worker crashed mid-send. Each run now tags its ids. Two new tests fail with the exact error before the fix.
+
+## Results
+
+A live run with Jev and the OpenAI writer, before reactivation and missed-call voice were added:
+
+| Category | Run | Passed |
 | --- | --- | --- |
-| Texting | conversation, reminders, opt-out, booking, simulator, 64 scenarios | done |
-| Twilio texts | incoming-text webhook, sending, delivery status | built; Virtual Phone test next |
-| Owner alerts | email, plus text for urgent alerts and new bookings | done |
-| Reactivation | old-lead campaigns with per-contact consent proof | done |
-| Missed-call voice | ConversationRelay, booking or a message, 22 call scenarios | done (simulator) |
-| Monthly report | last month's results emailed on the 1st | done |
-| Deployment | Docker image, per-client compose and Caddy, nightly encrypted backups, update with rollback | built and checked locally; not live yet |
-| Real phones | after toll-free verification is approved | waiting |
+| Booking | 15 | 15 |
+| Adversarial | 12 | 12 |
+| Hand-off to a person | 9 | 9 |
+| Writer answers | 8 | 8 |
+| Opt-out | 8 | 8 |
+| Fixed answers | 5 | 5 |
+| No reply | 3 | 3 |
 
-The worker prints each text unless it's started with `--send`.
+The current 64 text and 22 call scenarios all pass with offline keyword stand-ins for Jev and no writer. All 431 tests run offline, with Twilio, Jev, OpenAI, SMTP and the calendar faked.
 
-## How it works
+Texts to real US numbers wait on Twilio toll-free verification, so Twilio has only been tested with its Virtual Phone.
 
-Two processes share one SQLite file:
+## How I worked
 
-- **The server** (`main.py`, `server.py`) shows the form, records the lead and the exact
-  consent wording the person saw, and schedules the first text. It also takes Twilio's two
-  webhooks: incoming texts (`/twilio/incoming`) and delivery reports (`/twilio/status`). Each is
-  checked against Twilio's signature, saved, and answered at once. It never sends.
-- **The worker** (`worker.py`) answers incoming texts, queues the first text and the
-  reminders (+2 hours, +1 day, +3 days), hands quiet conversations to the owner, and sends
-  what's queued (`twilio_sms.py`). A text Twilio reports as undelivered alerts the owner with
-  Twilio's error code.
+The bot was built in small steps (texting, Twilio, owner alerts, per-company config, reactivation, missed-call voice, the monthly report), and every step ended with pytest, mypy and ruff clean and the scenario runner passing, offline and, where the step touched what the models do, live. The scenario files are the spec: each conversation states what the bot must say and what must end up saved.
 
-Whenever a person has to act (an active leak, a request for a person, a question the bot
-couldn't answer, a text that wasn't delivered), the bot raises an owner alert, and the worker
-emails it to the owner (`owner_alerts.py`): one email per alert, with the lead's details, their
-answers and the whole conversation. Urgent ones say URGENT in the subject. A failed email is
-retried, never dropped. `worker --send` won't start without alert email, because the bot tells
-homeowners things like "I'll flag this as urgent for our team".
+---
 
-With `OWNER_ALERT_PHONE` set, the alerts that need action today are also texted to the owner:
-water coming in, a homeowner asking for a person or to move their booking, every new booking,
-and the calendar failing. Only alerts under two hours old are texted, and a text that was
-refused or may have gone is never resent; the email carries every alert either way. The owner
-texting back ("ok, calling her") is ignored, not turned into a new alert.
-
-Reactivation (`reactivation.py`) texts a client's old leads, asking whether they still want a
-free roof inspection. The client's list is a CSV with `full_name, phone, address, consent_date,
-consent_source, consent_wording`; a row missing any consent value is refused, because a text the
-business can't show consent for is the costly kind. Each contact becomes an ordinary lead, so the
-conversation, booking, opt-out and alerts are the same as for a form lead. The worker starts up
-to the daily limit (50 by default) spread across the texting window, re-checking the do-not-call
-list at each contact's turn. An old lead gets one reminder, two days later. One who never replies
-raises no owner alert, and "no, already fixed" ends with one polite text and the do-not-call list.
-
-```bash
-uv run python -m lead_bot.reactivation import old-leads.csv --name spring-2026 --dry-run  # check, save nothing
-uv run python -m lead_bot.reactivation import old-leads.csv --name spring-2026 --daily-limit 50
-uv run python -m lead_bot.reactivation status
-```
-
-Read the consent wordings the dry run lists before importing for real: whether a wording covers
-automated texts from this business is for a person (ideally the client's lawyer) to judge.
-
-Missed calls (`call_session.py`, `relay.py`): the business's line forwards calls nobody picked up
-to the Twilio number, whose "A call comes in" webhook is `<PUBLIC_BASE_URL>/twilio/voice/incoming`
-(POST). The server records the call with a one-time token and connects it to the live WebSocket
-at `/calls/relay` through Twilio ConversationRelay, which does the speech in both directions. The
-bot says it's an automated assistant and that the call is transcribed, then either books an
-inspection (name, address read back, the usual questions, a time) or takes a message for a call
-back. A caller already on file hears their address only after their name matched. After booking,
-a new caller is asked whether they may be texted the details; a yes is stored as consent with the
-exact question. Every call ends with an owner alert and the transcript; a message or a booking is
-also texted to the owner with `OWNER_ALERT_PHONE`. Calls need the model keys in the server's
-`.env` too, and a Twilio account that isn't a trial (trials strip ConversationRelay).
-
-```bash
-uv run python -m lead_bot.simulate --call --offline           # you are the caller, in the terminal
-uv run python -m lead_bot.simulate --call --known --offline   # ... calling from a number on file
-uv run python -m lead_bot.call_scenarios --offline            # ~20 scripted calls; scenarios/call-report.md
-```
-
-Monthly report (`report.py`): on or after 8 AM on the 1st, the worker emails the owner last
-month's results: inspections booked and where they came from (web form, phone calls, old-lead
-campaigns), form leads texted, replied and booked, missed calls answered, campaign replies,
-urgent leaks, hand-offs, opt-outs, and the three most recent bookings. Months follow the
-business's timezone. Each month goes once (`monthly_reports`), and a new install sends nothing
-for the month before its first lead or call.
-
-```bash
-uv run python -m lead_bot.report                          # preview last month's report
-uv run python -m lead_bot.report --month 2026-10 --send   # email a month now
-```
-
-Every bot text is fixed wording from `text_script.py`. Jev only classifies what the homeowner
-wrote. The writer (OpenAI) drafts an answer only to an off-script question, and the guard
-(Jev checks plus regex backstops) must pass the draft before it is sent; otherwise the
-homeowner gets the fixed "I'll pass that question to our team" text and the owner is alerted.
-
-Opt-out: a bare STOP is left to Twilio, which blocks the number and confirms. "Please stop
-texting me" in any words is caught before Jev and gets exactly one confirmation. Either way
-the number goes on the bot's do-not-call list, and nothing is ever sent to it again.
-
-## Run it
+## Setup
 
 ```bash
 uv sync
-# .env (git-ignored):
-#   BUSINESS_NAME=<the business's REGISTERED name: it starts the first text to every lead>
-#   BUSINESS_CALLBACK_PHONE=<a number people can call; the last reminder and HELP give it>
-#   TYPESAFE_API_KEY=<Jev>                   # not needed with --offline
-#   OPENAI_API_KEY=<the writer>              # not needed with --offline
-#   WRITER_MODEL=gpt-6-luna                  # optional, this is the default
-#   BUSINESS_TIMEZONE=America/Phoenix        # optional, this is the default
-#   LEAD_BOT_DB_PATH=lead_bot.db             # optional, this is the default
-#   CLIENT_CONFIG_PATH=client.toml           # optional, this is the default
-#   GOOGLE_CALENDAR_ID=primary               # optional, this is the default
-#   TWILIO_ACCOUNT_SID=<starts with AC>      # all three Twilio values, or none (dry run)
-#   TWILIO_AUTH_TOKEN=<Console, Account info>
-#   TWILIO_PHONE_NUMBER=<the texting number>
-#   PUBLIC_BASE_URL=https://<machine>.<tailnet>.ts.net   # the address Twilio calls
-#   OWNER_ALERT_EMAIL=<where owner alerts go>            # all three alert values, or none
-#   SMTP_USERNAME=<the Gmail address that sends them>
-#   SMTP_PASSWORD=<a Gmail app password, not the account password>
-#   OWNER_ALERT_PHONE=<the owner's mobile>   # optional: urgent alerts also by text
-uv run fastapi dev src/lead_bot/main.py      # the form at http://127.0.0.1:8000/
-uv run python -m lead_bot.worker             # second terminal; dry run, texts are printed
-uv run python -m lead_bot.worker --send      # or: real texts through Twilio
-uv run python -m lead_bot.owner_alerts --test  # one test email, to check the alert settings
-uv run python -m lead_bot.google_login       # once, before the worker books real events
-```
-
-### Setting up owner alert email (Gmail)
-
-1. Turn on 2-Step Verification for the sending Google account.
-2. Create an app password at myaccount.google.com/apppasswords and put it in `SMTP_PASSWORD`
-   (the spaces Google shows don't matter).
-3. Run `uv run python -m lead_bot.owner_alerts --test` and check the inbox.
-
-Without these, the dry-run worker prints each alert email instead, and none is marked as sent,
-so they all go out once email is set up.
-
-### Connecting Twilio
-
-1. `tailscale funnel 8000` makes the server reachable at `https://<machine>.<tailnet>.ts.net`.
-   Put exactly that in `PUBLIC_BASE_URL`: Twilio signs the URL it calls, and the server checks
-   the signature against this address, so a mismatch refuses every text with 403.
-2. In the Twilio Console, open the number's messaging settings and set "A message comes in" to
-   `<PUBLIC_BASE_URL>/twilio/incoming`, HTTP POST. Delivery reports need no setting: each send
-   asks for them at `/twilio/status`.
-3. Test with the Console's Virtual Phone (Messaging > Virtual Phone) until toll-free
-   verification is approved; real US numbers get error 30032 before then.
-
-If Twilio rejects the account SID or auth token, the worker stops with exit code 78 and puts the
-text it was sending back in the queue.
-
-## Text the bot
-
-```bash
-# Keyword stand-ins for Jev and an in-memory calendar: no keys, nothing real touched.
+cp client.example.toml client.toml   # the business's facts and inspection hours
 uv run python -m lead_bot.simulate --offline
-
-# Real Jev and the real writer (billed), still an in-memory calendar:
-uv run python -m lead_bot.simulate
 ```
 
-Type what the homeowner texts. `/wait 2h` (or `30m`, `1d`) lets time pass so reminders and
-hand-offs happen, `/state` shows the saved answers and owner alerts, and `/quit` stops.
-The simulator starts its clock inside texting hours (8 AM to 8:30 PM in the business's
-timezone), so it works at any time of day.
+The simulator and the offline scenarios need no keys. For the rest, put these in `.env` (git-ignored):
 
-## Checks
+- **Business:** `BUSINESS_NAME` (the registered name; it starts every first text), `BUSINESS_CALLBACK_PHONE`. Optional: `BUSINESS_TIMEZONE` (default `America/Phoenix`).
+- **Models:** `TYPESAFE_API_KEY` (Jev) and `OPENAI_API_KEY` (the writer). Optional: `WRITER_MODEL`.
+- **Twilio:** `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`, all three or none (a dry run, with texts printed). `PUBLIC_BASE_URL` must be exactly the address Twilio calls, because the server checks Twilio's signature against it.
+- **Owner alerts:** `OWNER_ALERT_EMAIL`, `SMTP_USERNAME`, `SMTP_PASSWORD` (a Gmail app password), all three or none. Optional: `OWNER_ALERT_PHONE` for urgent alerts by text.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `uv run fastapi dev src/lead_bot/main.py` | The server: the lead form at `http://127.0.0.1:8000/` and Twilio's webhooks. |
+| `uv run python -m lead_bot.worker` | The worker, as a dry run that prints each text. `--send` sends through Twilio. |
+| `uv run python -m lead_bot.simulate --offline` | Text the bot from the terminal. `/wait 2h` lets time pass, `/state` shows what's saved. Without `--offline` it uses the real models (billed). |
+| `uv run python -m lead_bot.simulate --call --offline` | Be a caller the office missed. `--known` calls from a number already on file. |
+| `uv run python -m lead_bot.scenarios --offline` | Run the scripted text conversations; the report goes to `scenarios/report.md`. |
+| `uv run python -m lead_bot.call_scenarios --offline` | Run the scripted calls; the report goes to `scenarios/call-report.md`. |
+| `uv run python -m lead_bot.reactivation import old-leads.csv --name spring --dry-run` | Check an old-lead list; rows without consent proof are refused. |
+| `uv run python -m lead_bot.report` | Preview last month's results email. |
+| `uv run python -m lead_bot.owner_alerts --test` | Send one test alert email. |
+| `uv run python -m lead_bot.google_login` | Sign in to Google Calendar once, before real bookings. |
+
+## Tests
 
 ```bash
-uv run pytest -q && uv run mypy src tests && uv run ruff check src tests
-
-# ~50 scripted conversations through the real worker; report in scenarios/report.md.
-uv run python -m lead_bot.scenarios --offline   # keyword stand-ins, free
-uv run python -m lead_bot.scenarios             # real Jev and writer (billed)
+uv run pytest
+uv run mypy src tests
+uv run ruff check src tests
 ```
 
-`--offline` skips the scenarios marked `needs_real_jev`, whose wording only a real model can
-follow. `--only <category or name>` runs a subset.
+Every outside service is faked in tests. The scenario runners without `--offline` call Jev and OpenAI and are billed.
 
-## Before a real client
+## Windows note
 
-- Have a telemarketing lawyer review the consent wording (`src/lead_bot/consent.py`), the
-  first text and reminders (`src/lead_bot/text_script.py`), and the texting window
-  (`src/lead_bot/timing.py`). Their comments cite the rules they implement (47 CFR 64.1200).
-- Toll-free verification needs a real business (an EIN, or a sole proprietor), this opt-in
-  page on a site it owns, and sample messages. Until it's approved, texts to US and Canadian
-  numbers are blocked (Twilio error 30032).
-- The business facts the writer may use and the inspection hours come from `client.toml`
-  (git-ignored; copy `client.example.toml`, whose values are placeholders). Fill it in with the
-  roofer's own. `CLIENT_CONFIG_PATH` points elsewhere if needed. Tests, scenarios and the
-  simulator always use `client.example.toml`.
-- The bot never discusses insurance coverage: in roofing that can count as unlicensed public
-  adjusting.
+Antivirus HTTPS scanning (Norton here) breaks Python's TLS in two ways: an `SSLKEYLOGFILE` pointing at a named pipe crashes Python when it builds a TLS context, and the scanner's own certificate isn't in Python's trust bundle. Unset `SSLKEYLOGFILE` before running the tests, and for live runs point `SSL_CERT_FILE` at a bundle that includes the Windows trust store.
+
+## License
+
+Copyright (c) 2026 Yomi Lebi. All rights reserved. This code is shared for viewing only; it may not be copied, modified or reused without permission.

@@ -1,3 +1,2 @@
-# The bot deploys to a Linux VPS: store every text file with LF line endings, whatever the
-# Windows checkout does locally.
+# Store every text file with LF line endings, whatever the Windows checkout does locally.
 * text=auto eol=lf

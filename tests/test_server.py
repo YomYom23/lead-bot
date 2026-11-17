@@ -139,7 +139,7 @@ def test_typed_html_is_shown_as_text_not_run(store: Store) -> None:
 def test_consent_evidence_records_the_public_address_not_the_internal_one(
     store: Store, tmp_path: Path
 ) -> None:
-    # Behind Caddy the server sees http://lead-bot-<client>-server:8000/leads. The record must
+    # Behind a reverse proxy the server sees an internal address. The record must
     # name the page the homeowner actually used, which is PUBLIC_BASE_URL plus the path.
     public_settings = replace(SETTINGS, public_base_url="https://demo.bot.example.com/")
     app = create_app(store, public_settings, clock=lambda: MONDAY_10AM)
