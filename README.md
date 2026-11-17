@@ -146,7 +146,3 @@ Every outside service is faked in tests. The scenario runners without `--offline
 ## Windows note
 
 Antivirus HTTPS scanning (Norton here) breaks Python's TLS in two ways: an `SSLKEYLOGFILE` pointing at a named pipe crashes Python when it builds a TLS context, and the scanner's own certificate isn't in Python's trust bundle. Unset `SSLKEYLOGFILE` before running the tests, and for live runs point `SSL_CERT_FILE` at a bundle that includes the Windows trust store.
-
-## License
-
-Copyright (c) 2026 Yomi Lebi. All rights reserved. This code is shared for viewing only; it may not be copied, modified or reused without permission.
