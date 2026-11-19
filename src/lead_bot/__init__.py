@@ -1,5 +1,5 @@
 # lead-bot/src/lead_bot/__init__.py
-"""lead-bot: answers a roofing company's web leads by text message and books a free inspection.
+"""lead-agent: answers a roofing company's web leads by text message and books a free inspection.
 
 A homeowner fills in the inspection form (server.py). If they agreed to texts, the worker
 (worker.py) texts them within a minute, inside legal texting hours (timing.py), and keeps a proof

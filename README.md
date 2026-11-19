@@ -1,4 +1,4 @@
-# Lead Bot
+# Lead Agent
 
 Answers a roofing company's web leads by text message. Within seconds of the form being sent, it texts the homeowner, asks four questions and books a free inspection on the company's Google Calendar. It also answers calls the office missed, texts a company's old leads in small daily campaigns, alerts the owner by email and text when a person is needed, and emails a monthly results report.
 
@@ -9,22 +9,22 @@ Python · FastAPI · Twilio SMS and ConversationRelay · TypeSafe Jev · OpenAI 
 ![A simulator run: the homeowner asks about insurance, reports a leak and books a time (fictional lead and company)](media/demo.gif)
 
 ```bash
-uv run python -m lead_bot.simulate --offline   # you are the homeowner, texting the bot
+uv run python -m lead_bot.simulate --offline   # you are the homeowner, texting the agent
 ```
 
 ## Why I built it
 
-Roofers lose leads by replying hours late, and the first company to answer usually gets the job. A bot that replies instantly is easy to build. The hard part is one that is safe to let loose on the public: it must never quote a price, never talk about insurance (in roofing that can count as unlicensed public adjusting), never claim a booking it didn't make, and be able to show that each person agreed to be texted. I wanted to find out how much of that can be enforced in code instead of asked for in a prompt.
+Roofers lose leads by replying hours late, and the first company to answer usually gets the job. An agent that replies instantly is easy to build. The hard part is one that is safe to let loose on the public: it must never quote a price, never talk about insurance (in roofing that can count as unlicensed public adjusting), never claim a booking it didn't make, and be able to show that each person agreed to be texted. I wanted to find out how much of that can be enforced in code instead of asked for in a prompt.
 
 ## What a conversation looks like
 
 1. The homeowner fills in the form. The server saves the lead together with the exact consent wording they saw, and schedules the first text inside the legal texting window.
-2. The bot introduces itself as an automated assistant and confirms the address.
+2. The agent introduces itself as an automated assistant and confirms the address.
 3. It asks whether water is coming in, whether there's an insurance claim, and whether they own the home. "Yes, it's dripping into the bedroom" raises an urgent alert for the owner.
 4. It offers three open inspection times from the calendar and books the one picked, by number or in words.
 5. Quiet leads get reminders at 2 hours, 1 day and 3 days, then go to the owner. "Please stop texting me", in any words, gets one confirmation and a place on the do-not-call list.
 
-Missed calls follow the same steps by voice: the business's line forwards unanswered calls to the bot, which books an inspection or takes a message, and every call ends with an owner alert and the transcript.
+Missed calls follow the same steps by voice: the business's line forwards unanswered calls to the agent, which books an inspection or takes a message, and every call ends with an owner alert and the transcript.
 
 ## How it's built
 
@@ -49,9 +49,9 @@ Two processes share one SQLite file. The server takes the form and Twilio's webh
 
 ## Design decisions
 
-### The bot's words are fixed, and the model only reads
+### The agent's words are fixed, and the model only reads
 
-Every text the bot sends comes from `text_script.py`. Jev's job is to classify what the homeowner wrote: yes or no, a time choice, a request for a person, a question. The script then picks the next fixed line. A model writes words only for an off-script question, and only through the guard.
+Every text the agent sends comes from `text_script.py`. Jev's job is to classify what the homeowner wrote: yes or no, a time choice, a request for a person, a question. The script then picks the next fixed line. A model writes words only for an off-script question, and only through the guard.
 
 ### A draft is sent only after the guard passes it
 
@@ -63,11 +63,11 @@ Each lead records the exact consent wording the person saw and the address of th
 
 ### Opt-outs are caught before the model sees them
 
-A bare STOP is left to Twilio, which blocks the number and confirms. "Please stop texting me" in any other words is caught by code before Jev, and gets exactly one confirmation. Either way the number goes on the bot's own do-not-call list, and nothing is sent to it again.
+A bare STOP is left to Twilio, which blocks the number and confirms. "Please stop texting me" in any other words is caught by code before Jev, and gets exactly one confirmation. Either way the number goes on the agent's own do-not-call list, and nothing is sent to it again.
 
 ### A person is pulled in whenever it matters
 
-An active leak, a request for a person, a question the bot couldn't answer, a homeowner who wants to move their booking, or a text Twilio couldn't deliver each raises an owner alert, emailed with the lead's details, answers and the whole conversation. The urgent ones are also texted to the owner. A failed email is retried, never dropped, and `worker --send` won't start without alert email, because the bot tells homeowners things like "I'll flag this as urgent for our team".
+An active leak, a request for a person, a question the agent couldn't answer, a homeowner who wants to move their booking, or a text Twilio couldn't deliver each raises an owner alert, emailed with the lead's details, answers and the whole conversation. The urgent ones are also texted to the owner. A failed email is retried, never dropped, and `worker --send` won't start without alert email, because the agent tells homeowners things like "I'll flag this as urgent for our team".
 
 ## Things that broke
 
@@ -99,7 +99,7 @@ Texts to real US numbers wait on Twilio toll-free verification, so Twilio has on
 
 ## How I worked
 
-The bot was built in small steps (texting, Twilio, owner alerts, per-company config, reactivation, missed-call voice, the monthly report), and every step ended with pytest, mypy and ruff clean and the scenario runner passing, offline and, where the step touched what the models do, live. The scenario files are the spec: each conversation states what the bot must say and what must end up saved.
+The agent was built in small steps (texting, Twilio, owner alerts, per-company config, reactivation, missed-call voice, the monthly report), and every step ended with pytest, mypy and ruff clean and the scenario runner passing, offline and, where the step touched what the models do, live. The scenario files are the spec: each conversation states what the agent must say and what must end up saved.
 
 ---
 
@@ -124,7 +124,7 @@ The simulator and the offline scenarios need no keys. For the rest, put these in
 |---|---|
 | `uv run fastapi dev src/lead_bot/main.py` | The server: the lead form at `http://127.0.0.1:8000/` and Twilio's webhooks. |
 | `uv run python -m lead_bot.worker` | The worker, as a dry run that prints each text. `--send` sends through Twilio. |
-| `uv run python -m lead_bot.simulate --offline` | Text the bot from the terminal. `/wait 2h` lets time pass, `/state` shows what's saved. Without `--offline` it uses the real models (billed). |
+| `uv run python -m lead_bot.simulate --offline` | Text the agent from the terminal. `/wait 2h` lets time pass, `/state` shows what's saved. Without `--offline` it uses the real models (billed). |
 | `uv run python -m lead_bot.simulate --call --offline` | Be a caller the office missed. `--known` calls from a number already on file. |
 | `uv run python -m lead_bot.scenarios --offline` | Run the scripted text conversations; the report goes to `scenarios/report.md`. |
 | `uv run python -m lead_bot.call_scenarios --offline` | Run the scripted calls; the report goes to `scenarios/call-report.md`. |
